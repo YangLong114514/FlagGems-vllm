@@ -16,7 +16,7 @@ import torch
 import flaggems_vllm as gems
 from baseline import kda_recoverssm_verify as baseline
 from benchmark.base import Benchmark
-from benchmark.conftest import Config, update_result
+from benchmark.conftest import Config
 from benchmark.consts import BenchMode
 from flaggems_vllm.runtime import torch_device_fn
 from tests.test_kda_recoverssm_verify import (
@@ -63,37 +63,16 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
         super().init_user_config()
 
     def run(self):
-        self.native_op = None
-        self.native_reason = None
-        try:
-            self.native_op = baseline.native()
-            self.native_reason = baseline.NATIVE_UNAVAILABLE_REASON
-        except Exception as error:
-            self.native_reason = f"native resolution: {error!r}"
+        self.native_op = baseline.native()
         super().run()
 
     def get_input_iter(self, dtype):
-        misses = []
         cases = {case.name: case for case in baseline.PERF_CASES}
         for (name,) in self.shapes:
             self.case = cases[name]
             self.dtype = dtype
             self.latencies = None
-            self.row_native_reason = self.native_reason
             yield (baseline.build(self.case, dtype, self.device),)
-            if self.row_native_reason:
-                misses.append(dict(shape=name, reason=self.row_native_reason))
-        if misses:
-            update_result(
-                self.op_name,
-                dict(
-                    dtype=str(dtype),
-                    native_baseline_skip_reason="; ".join(
-                        dict.fromkeys(row["reason"] for row in misses)
-                    ),
-                    native_baseline_misses=misses,
-                ),
-            )
 
     def record_shapes(self, *args, **kwargs):
         return dict(case=self.case.name, inputs=super().record_shapes(*args, **kwargs))
@@ -119,15 +98,8 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
             selected_source=None,
         )
         functions = {"gems": self.gems_op}
-        if self.native_op is not None and "latency_base" in self.to_bench_metrics:
-            if self.native_op is self.gems_op:
-                self.row_native_reason = "native resolves to the Gems candidate"
-            else:
-                self.row_native_reason = baseline.unsupported_reason(
-                    {"case": self.case}, self.dtype
-                )
-            if self.row_native_reason is None:
-                functions["native"] = self.native_op
+        if "latency_base" in self.to_bench_metrics:
+            functions["native"] = self.native_op
 
         candidate_error = None
         for name, fn in functions.items():
@@ -160,10 +132,8 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
                 if name == "gems":
                     candidate_error = error
                 else:
-                    self.row_native_reason = repr(error)
+                    raise
 
-        if self.row_native_reason:
-            row["native_error"] = self.row_native_reason
         if row["native_ms"] is not None and "gems_ms" in row:
             row["native_speedup"] = row["native_ms"] / row["gems_ms"]
             row["selected_source"] = "native"
