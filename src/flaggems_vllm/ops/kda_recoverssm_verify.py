@@ -22,6 +22,16 @@ from flaggems_vllm.utils import libentry, libtuner
 # checkpoint slot is <= null_block_id have no state and produce zero outputs.
 DEFAULT_NULL_BLOCK_ID = 0
 
+# Fast-launch cache: key -> (CudaLauncher, function, packed_metadata, tuned BV).
+# Populated from the CompiledKernel that the first (slow) libentry/libtuner call
+# returns, so autotuning and compilation always happen through the mandated
+# libtuner path; the cache only skips re-deriving the specialization key on
+# later calls. The key carries every input the Triton binder specializes on
+# (dtypes, pointer alignment, exact stride/scalar values, constexprs), so a
+# key hit guarantees the cached binary is the one the slow path would pick.
+_FAST_LAUNCH_CACHE = {}
+_FAST_LAUNCH_CACHE_LIMIT = 1024
+
 
 @triton.jit
 def _kda_gate(
@@ -326,27 +336,9 @@ def kda_recoverssm_verify(
         return out
 
     block_k = triton.next_power_of_2(key_dim)
-    grid = lambda meta: (  # noqa: E731
-        triton.cdiv(value_dim, meta["BV"]),
-        batch,
-        num_heads,
-    )
-    _kda_recoverssm_verify_kernel[grid](
-        q,
-        k,
-        v,
-        raw_g,
-        raw_beta,
-        A_log,
-        dt_bias,
-        checkpoint_state,
-        correction_cache,
-        kg_cache,
-        out,
-        query_start_loc,
-        state_indices,
-        lower_bound or 0.0,
-        null_block_id,
+    gate_lower_bound = lower_bound or 0.0
+    use_lower_bound = lower_bound is not None
+    strides = (
         q.stride(1),
         k.stride(1),
         v.stride(1),
@@ -367,10 +359,124 @@ def kda_recoverssm_verify(
         out.stride(1),
         query_start_loc.stride(0),
         state_indices.stride(0),
+    )
+    fast_key = (
+        q.dtype,
+        k.dtype,
+        v.dtype,
+        raw_g.dtype,
+        raw_beta.dtype,
+        A_log.dtype,
+        dt_bias.dtype,
+        checkpoint_state.dtype,
+        correction_cache.dtype,
+        kg_cache.dtype,
+        out.dtype,
+        query_start_loc.dtype,
+        state_indices.dtype,
+        q.data_ptr() & 15,
+        k.data_ptr() & 15,
+        v.data_ptr() & 15,
+        raw_g.data_ptr() & 15,
+        raw_beta.data_ptr() & 15,
+        A_log.data_ptr() & 15,
+        dt_bias.data_ptr() & 15,
+        checkpoint_state.data_ptr() & 15,
+        correction_cache.data_ptr() & 15,
+        kg_cache.data_ptr() & 15,
+        out.data_ptr() & 15,
+        query_start_loc.data_ptr() & 15,
+        state_indices.data_ptr() & 15,
+        gate_lower_bound,
+        null_block_id,
+        strides,
+        key_dim,
+        value_dim,
+        spec_query_len,
+        q.get_device(),
+    )
+    entry = _FAST_LAUNCH_CACHE.get(fast_key)
+    if entry is not None:
+        launcher, function, packed_metadata, block_v = entry
+        launcher(
+            -(-value_dim // block_v),
+            batch,
+            num_heads,
+            torch._C._cuda_getCurrentRawStream(q.get_device()),
+            function,
+            packed_metadata,
+            None,
+            None,
+            None,
+            q,
+            k,
+            v,
+            raw_g,
+            raw_beta,
+            A_log,
+            dt_bias,
+            checkpoint_state,
+            correction_cache,
+            kg_cache,
+            out,
+            query_start_loc,
+            state_indices,
+            gate_lower_bound,
+            null_block_id,
+            *strides,
+            key_dim,
+            value_dim,
+            block_k,
+            block_v,
+            spec_query_len,
+            use_lower_bound,
+        )
+        return out
+
+    grid = lambda meta: (  # noqa: E731
+        triton.cdiv(value_dim, meta["BV"]),
+        batch,
+        num_heads,
+    )
+    result = _kda_recoverssm_verify_kernel[grid](
+        q,
+        k,
+        v,
+        raw_g,
+        raw_beta,
+        A_log,
+        dt_bias,
+        checkpoint_state,
+        correction_cache,
+        kg_cache,
+        out,
+        query_start_loc,
+        state_indices,
+        gate_lower_bound,
+        null_block_id,
+        *strides,
         K=key_dim,
         V=value_dim,
         BK=block_k,
         SPEC_QUERY_LEN=spec_query_len,
-        USE_LOWER_BOUND=lower_bound is not None,
+        USE_LOWER_BOUND=use_lower_bound,
     )
+    try:
+        kernel, constexprs = result
+        launcher = kernel.run  # CudaLauncher; requires zero scratch buffers
+        if (
+            type(launcher).__module__.startswith("triton.backends.nvidia")
+            and launcher.global_scratch_size == 0
+            and launcher.profile_scratch_size == 0
+        ):
+            if len(_FAST_LAUNCH_CACHE) >= _FAST_LAUNCH_CACHE_LIMIT:
+                _FAST_LAUNCH_CACHE.clear()
+            _FAST_LAUNCH_CACHE[fast_key] = (
+                launcher,
+                kernel.function,
+                kernel.packed_metadata,
+                constexprs["BV"],
+            )
+    except (AttributeError, KeyError, TypeError):
+        pass  # fast path unavailable; every call keeps using the libentry path
     return out
