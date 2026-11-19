@@ -15,13 +15,7 @@ import torch
 import torch.nn.functional as F
 
 import flaggems_vllm as gems
-from baseline.kda_recoverssm_verify import (
-    NATIVE_UNAVAILABLE_REASON,
-    PERF_CASES,
-    Case,
-    build,
-    native,
-)
+from baseline.kda_recoverssm_verify import PERF_CASES, Case, build, native
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
@@ -33,10 +27,6 @@ DTYPES = [torch.float16, torch.bfloat16]
 # bf16/fp16 outputs are produced by fp32 math rounded once on store.
 OUT_TOL = {torch.float16: 1.5e-2, torch.bfloat16: 3e-2}
 CORRECTION_TOL = 1e-3  # records.correction is stored in fp32
-
-requires_native = pytest.mark.skipif(
-    NATIVE is None, reason=f"native baseline unavailable: {NATIVE_UNAVAILABLE_REASON}"
-)
 
 
 def reference(case, inputs):
@@ -61,8 +51,9 @@ def reference(case, inputs):
     dt_bias = inputs["dt_bias"].to(torch.float64).view(heads, dim)
     a = torch.exp(inputs["A_log"].to(torch.float64))  # [H]
     out = torch.zeros_like(v, dtype=torch.float64)
-    corr_all = torch.zeros(batch, heads, window, v.shape[-1], dtype=torch.float64)
-    corr_all = corr_all.to(q.device)
+    corr_all = torch.zeros(
+        batch, heads, window, v.shape[-1], dtype=torch.float64, device=q.device
+    )
     written = torch.zeros(batch, window, dtype=torch.bool, device=q.device)
     for off in range(max(case.lengths, default=0)):
         t = (bos + off).clamp(max=total_tokens - 1)
@@ -103,7 +94,6 @@ def assert_records_match(case, inputs, records, ref_corr, written):
             assert torch.equal(records.key_gate[b, :, off, d:], inputs["raw_g"][0, t])
 
 
-@requires_native
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c.name for c in PERF_CASES])
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_native_against_torch_oracle(case, dtype):
@@ -126,7 +116,6 @@ def test_native_against_torch_oracle(case, dtype):
     assert_records_match(case, inputs, inputs["records"], ref_corr, written)
 
 
-@requires_native
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c.name for c in PERF_CASES])
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_gems_matches_native(case, dtype):
@@ -161,11 +150,10 @@ def test_gems_matches_native(case, dtype):
 def test_out_argument_and_duck_typed_records(dtype):
     case = Case("k3_tp8_mtp1_bs32", [2] * 32, window=2, heads=12)
     inputs = build(case, dtype, "cuda")
-    records = types.SimpleNamespace(
+    inputs["records"] = types.SimpleNamespace(
         correction=torch.empty_like(inputs["records"].correction),
         key_gate=torch.empty_like(inputs["records"].key_gate),
     )
-    inputs["records"] = records
     out = torch.empty_like(inputs["v"])
     returned = gems.kda_recoverssm_verify(**inputs, out=out)
     torch.cuda.synchronize()
@@ -173,7 +161,7 @@ def test_out_argument_and_duck_typed_records(dtype):
     ref_out, ref_corr, written = reference(case, inputs)
     err = (out.to(torch.float64) - ref_out).abs().max().item()
     assert err <= OUT_TOL[dtype], f"out max abs err {err:.3e}"
-    assert_records_match(case, inputs, records, ref_corr, written)
+    assert_records_match(case, inputs, inputs["records"], ref_corr, written)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

@@ -58,7 +58,7 @@ test-nvidia = [
 # Native vLLM builds that carry the reference kernels used by the benchmark
 # baselines. Each extra targets exactly one backend image.
 nvidia = [
-    "vllm @ https://files.pythonhosted.org/packages/00/33/3f0abda52acff437a471cf3a2bf204213eb4102975b2677512cd76f2b45e/vllm-0.24.0-cp38-abi3-manylinux_2_28_x86_64.whl",
+    "vllm @ https://files.pythonhosted.org/packages/0b/2c/55f3b76ceadbfc6d515f16b1c17e2e69136c8e54d47be2a94b9f7326f9bb/vllm-0.34.0-cp38-abi3-manylinux_2_28_x86_64.whl",
 ]
 metax = [
     "mcoplib @ https://repos.metax-tech.com/r/maca-pypi/packages/mcoplib/0.4.9+g8b5bd8b.maca3.8.0.25.torch2.10/mcoplib-0.4.9+g8b5bd8b.maca3.8.0.25.torch2.10-cp312-cp312-linux_x86_64.whl",
