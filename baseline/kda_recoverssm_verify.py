@@ -33,7 +33,7 @@ class Case(NamedTuple):
     null_requests: tuple = ()  # requests without a checkpoint (NULL_BLOCK_ID)
 
 
-PERF_CASES = [
+PRODUCTION_CASES = [
     # Kimi K3 production shapes: window = 1 + num_spec (MTP-1 -> 2, spec-3 -> 4,
     # max 8), per-rank heads = 96/TP, decode batch up to 256, head_dim 128,
     # gate_lower_bound -5.0.
@@ -47,11 +47,16 @@ PERF_CASES = [
     Case("k3_tp2_mtp1_bs64", [2] * 64, window=2, heads=48),
     Case("k3_tp1_mtp1_bs8", [2] * 8, window=2, heads=96),
     Case("k3_tp1_spec3_bs16", [4] * 16, window=4, heads=96),
-    # Edge shapes: ragged windows, missing checkpoints, unbounded gate.
+]
+
+EDGE_CASES = [
+    # Functional edge cases, excluded from production performance aggregation.
     Case("ragged", [8, 3, 6, 1, 8], window=8, heads=12),
     Case("null_ckpt", [4] * 4, window=4, heads=12, null_requests=(1, 3)),
     Case("lb_none_small", [2] * 4, window=2, heads=4, lower_bound=None),
 ]
+
+PERF_CASES = PRODUCTION_CASES + EDGE_CASES
 
 
 def grid():
@@ -67,7 +72,7 @@ def key_shape(binding):
     )
 
 
-def build(case, dtype, device):
+def build(case, dtype, device, state_dtype=torch.float32):
     case = Case(*case)
     gen = torch.Generator().manual_seed(INPUT_SEED)
     n, total = len(case.lengths), sum(case.lengths)
@@ -84,7 +89,7 @@ def build(case, dtype, device):
     a_log = rand((h,), torch.float32)
     dt_bias = rand((h * d,), torch.float32)
     num_blocks = n + 4
-    checkpoint_state = rand((num_blocks, h, d, d))
+    checkpoint_state = rand((num_blocks, h, d, d), state_dtype)
     records = KDARecoverSSMRecords.allocate(
         n, h, case.window, d, dtype, torch.device(device)
     )
@@ -124,7 +129,7 @@ def unsupported_reason(binding, dtype):
     return None
 
 
-def config(binding, dtype):
+def config(binding, dtype, state_dtype=torch.float32):
     case = Case(*binding["case"])
     n, total = len(case.lengths), sum(case.lengths)
     h, d, w = case.heads, case.head_dim, case.window
@@ -146,7 +151,7 @@ def config(binding, dtype):
         "A_log": tensor([h], torch.float32),
         "dt_bias": tensor([h * d], torch.float32),
         "lower_bound": {"scalar": case.lower_bound},
-        "checkpoint_state": tensor([num_blocks, h, d, d], dtype),
+        "checkpoint_state": tensor([num_blocks, h, d, d], state_dtype),
         "records": {
             "correction": tensor([n, h, w, d], torch.float32),
             "key_gate": tensor([n, h, w, 2 * d], dtype),

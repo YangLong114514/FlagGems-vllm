@@ -24,6 +24,11 @@ pytestmark = [
 
 NATIVE = native()
 DTYPES = [torch.float16, torch.bfloat16]
+PRECISIONS = [
+    pytest.param(torch.bfloat16, torch.float32, id="bf16_activation_fp32_state"),
+    pytest.param(torch.bfloat16, torch.bfloat16, id="bf16_activation_bf16_state"),
+    pytest.param(torch.float16, torch.float32, id="fp16_activation_fp32_state"),
+]
 # bf16/fp16 outputs are produced by fp32 math rounded once on store.
 OUT_TOL = {torch.float16: 1.5e-2, torch.bfloat16: 3e-2}
 CORRECTION_TOL = 1e-3  # records.correction is stored in fp32
@@ -95,9 +100,9 @@ def assert_records_match(case, inputs, records, ref_corr, written):
 
 
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c.name for c in PERF_CASES])
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_native_against_torch_oracle(case, dtype):
-    inputs = build(case, dtype, "cuda")
+@pytest.mark.parametrize("dtype,state_dtype", PRECISIONS)
+def test_native_against_torch_oracle(case, dtype, state_dtype):
+    inputs = build(case, dtype, "cuda", state_dtype)
     checkpoint_before = inputs["checkpoint_state"].clone()
 
     out = NATIVE(**inputs)
@@ -117,10 +122,10 @@ def test_native_against_torch_oracle(case, dtype):
 
 
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c.name for c in PERF_CASES])
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_gems_matches_native(case, dtype):
-    native_inputs = build(case, dtype, "cuda")
-    gems_inputs = build(case, dtype, "cuda")
+@pytest.mark.parametrize("dtype,state_dtype", PRECISIONS)
+def test_gems_matches_native(case, dtype, state_dtype):
+    native_inputs = build(case, dtype, "cuda", state_dtype)
+    gems_inputs = build(case, dtype, "cuda", state_dtype)
     checkpoint_before = gems_inputs["checkpoint_state"].clone()
 
     native_out = NATIVE(**native_inputs)
