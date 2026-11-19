@@ -48,9 +48,9 @@ def _native_slot(**data):
 
 
 class KDARecoverSSMVerifyBenchmark(Benchmark):
-    DEFAULT_DTYPES = baseline.DTYPES
-    DEFAULT_SHAPES = [(case.name,) for case in baseline.PERF_CASES]
-    DEFAULT_SHAPE_DESC = "case (baseline.PERF_CASES)"
+    DEFAULT_DTYPES = [torch.bfloat16]
+    DEFAULT_SHAPES = [(case.name,) for case in baseline.PRODUCTION_CASES]
+    DEFAULT_SHAPE_DESC = "case (baseline.PRODUCTION_CASES)"
 
     def set_shapes(self, shape_file_path=None):
         self.shapes = self.DEFAULT_SHAPES
