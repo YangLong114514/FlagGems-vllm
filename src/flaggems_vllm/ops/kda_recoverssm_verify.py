@@ -263,19 +263,14 @@ def kda_recoverssm_verify(
     state_indices: torch.Tensor,
     spec_query_len: int,
     out: Optional[torch.Tensor] = None,
-    null_block_id: int = DEFAULT_NULL_BLOCK_ID,
 ) -> torch.Tensor:
     """Verify a KDA speculative window without modifying its checkpoint.
 
-    Interface and semantics match
-    ``vllm.models.kimi_k3.nvidia.ops.recoverssm.kda_recoverssm_verify``:
-    request ``b`` reads its checkpoint from slot ``state_indices[b]`` of
-    ``checkpoint_state`` (never written) and writes its verify records to row
-    ``b`` of ``records``, which is any object exposing ``correction``
-    (``[max_num_reqs, H, Q, V]`` float32) and ``key_gate``
-    (``[max_num_reqs, H, Q, 2K]``, activation dtype) tensors, e.g. vLLM's
-    ``KDARecoverSSMRecords``. Returns the per-token KDA outputs
-    ``[1, total_tokens, H, V]``.
+    Request ``b`` reads slot ``state_indices[b]`` of ``checkpoint_state`` and
+    writes row ``b`` of ``records``. ``records`` exposes ``correction``
+    (``[max_num_reqs, H, Q, V]``, float32) and ``key_gate``
+    (``[max_num_reqs, H, Q, 2K]``, activation dtype). Returns per-token KDA
+    outputs with shape ``[1, total_tokens, H, V]``.
     """
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA RecoverSSM q must have shape [1, tokens, heads, dim]")
@@ -338,6 +333,7 @@ def kda_recoverssm_verify(
     block_k = triton.next_power_of_2(key_dim)
     gate_lower_bound = lower_bound or 0.0
     use_lower_bound = lower_bound is not None
+    null_block_id = DEFAULT_NULL_BLOCK_ID
     strides = (
         q.stride(1),
         k.stride(1),

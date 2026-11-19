@@ -1,77 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-"""Native vLLM KDA RecoverSSM speculative-verify workloads and signatures.
-
-The native callable is ``kda_recoverssm_verify`` from
-``vllm.models.kimi_k3.nvidia.ops.recoverssm`` -- a pure Triton kernel. Some
-installed vLLM builds cannot load their compiled extensions (``vllm._C`` /
-``vllm.vllm_flash_attn``, e.g. CUDA 13 extensions installed on a cu128 torch).
-Importing the module through the package path then dies inside
-``vllm.models.kimi_k3``'s eager package ``__init__`` long before the
-Triton-only ops submodule is reached. ``native()`` then falls back to
-registering stub parent packages so the submodule import skips that
-``__init__``; on healthy installs the plain import succeeds and nothing is
-patched. The kernel itself never touches the compiled extensions.
-"""
+"""Native vLLM KDA RecoverSSM speculative-verify workloads and signatures."""
 
 import math
-import os
-import sys
-import types
-from importlib import import_module
 from typing import NamedTuple, Optional
 
 import torch
+from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+    KDARecoverSSMRecords,
+    kda_recoverssm_verify as _native,
+)
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 OP_NAME = "kda_recoverssm_verify"
 DTYPES = [torch.float16, torch.bfloat16]
 IS_INPLACE = False
 MUTATED_INPUTS = ("out", "records")
-NATIVE_UNAVAILABLE_REASON = None
 INPUT_SEED = 20261118
-
-_MODULE = None
-_RECOVERSSM = "vllm.models.kimi_k3.nvidia.ops.recoverssm"
-
-
-def _recoverssm_module():
-    """Import vLLM's RecoverSSM ops module, bypassing a broken package init."""
-    global _MODULE
-    if _MODULE is not None:
-        return _MODULE
-    try:
-        _MODULE = import_module(_RECOVERSSM)
-        return _MODULE
-    except ImportError as first_error:
-        import vllm
-
-        root = os.path.dirname(os.path.abspath(vllm.__file__))
-        for pkg in ("vllm.models.kimi_k3", "vllm.models.kimi_k3.nvidia"):
-            # A failed first attempt can leave half-initialized parents in
-            # sys.modules; replace any of them with a stub and retry once.
-            # If the parents were healthy and the submodule itself is broken,
-            # the retry fails at the same place and surfaces that error.
-            sys.modules.pop(pkg, None)
-            stub = types.ModuleType(pkg)
-            stub.__path__ = [os.path.join(root, *pkg.split(".")[1:])]
-            stub.__package__ = pkg
-            sys.modules[pkg] = stub
-        try:
-            _MODULE = import_module(_RECOVERSSM)
-        except ImportError:
-            raise first_error
-        return _MODULE
 
 
 def native():
-    global NATIVE_UNAVAILABLE_REASON
-    try:
-        fn = _recoverssm_module().kda_recoverssm_verify
-    except Exception as exc:
-        NATIVE_UNAVAILABLE_REASON = repr(exc)
-        return None
-    NATIVE_UNAVAILABLE_REASON = None
-    return fn
+    return _native
 
 
 class Case(NamedTuple):
@@ -121,11 +70,6 @@ def key_shape(binding):
 def build(case, dtype, device):
     case = Case(*case)
     gen = torch.Generator().manual_seed(INPUT_SEED)
-    module = _recoverssm_module()
-    try:
-        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-    except ImportError:
-        NULL_BLOCK_ID = 0  # vllm.v1.attention.backends.utils.NULL_BLOCK_ID
     n, total = len(case.lengths), sum(case.lengths)
     h, d = case.heads, case.head_dim
 
@@ -141,7 +85,7 @@ def build(case, dtype, device):
     dt_bias = rand((h * d,), torch.float32)
     num_blocks = n + 4
     checkpoint_state = rand((num_blocks, h, d, d))
-    records = module.KDARecoverSSMRecords.allocate(
+    records = KDARecoverSSMRecords.allocate(
         n, h, case.window, d, dtype, torch.device(device)
     )
     query_start_loc = torch.tensor(
