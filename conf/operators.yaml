@@ -1176,6 +1176,23 @@ ops:
   - Attention
   stages:
   - beta: '0.3'
+- id: kda_recoverssm_verify
+  description: 'Verify one Kimi-K3 KDA speculative window per request against
+    its checkpointed SSM state without modifying the checkpoint, and write
+    per-token verify records (FP32 delta-rule correction u_t and the raw
+    key/gate pair) for the post-sampling state commit. Request b reads slot
+    state_indices[b] of the checkpoint pool (read-only; slots <=
+    NULL_BLOCK_ID produce zero outputs) and writes row b of the records.
+    Interface and semantics match the vLLM kernel.'
+  for:
+  - vllm.models.kimi_k3.nvidia.ops.recoverssm.kda_recoverssm_verify
+  labels:
+  - fused
+  - vLLM
+  kind:
+  - Attention
+  stages:
+  - beta: '0.3'
 - id: gate_sigmoid_mul
   description: Applies the sigmoid output gate to Kimi-K3 MLA attention output.
   for:
