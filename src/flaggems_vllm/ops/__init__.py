@@ -272,6 +272,7 @@ from flaggems_vllm.ops.kda_bounded import (
     safe_kda_gate,
     safe_kda_gate_chunk_cumsum,
 )
+from flaggems_vllm.ops.kda_recoverssm_verify import kda_recoverssm_verify
 from flaggems_vllm.ops.kpool import (
     fwht128_quant_fp8,
     hadamard128,
@@ -464,6 +465,7 @@ __all__ = [
     "qwen4_vendor_qsa_mqa_paged",
     "qwen4_vendor_store_qsa_rows",
     "recurrent_kda",
+    "kda_recoverssm_verify",
     "reglu",
     "reshape_and_cache",
     "reshape_and_cache_flash",
