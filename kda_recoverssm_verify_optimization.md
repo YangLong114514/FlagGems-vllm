@@ -210,7 +210,17 @@ NCU SpeedUp 为 `native NCU duration / Gems NCU duration`。Occupancy 为 achiev
 
 ## 6. 后续优化方向
 
-本轮 NCU 导向的 occupancy 调整和窗口级公式原型均未通过性能验收，当前没有新增保留项。后续不应直接重复这些配置；若重新启动 Q8 深度优化，需要能显著降低窗口内 pairwise 计算、布局转换、shared memory 和寄存器开销的新实现，并先解决 TF32 correction 精度，而不是继续扩大现有原型的 tile 或 warps。
+本轮 NCU 导向的 occupancy 调整和窗口级公式原型均未通过性能验收。后续不应直接重复这些配置；若重新启动 Q8 深度优化，需要能显著降低窗口内 pairwise 计算、布局转换、shared memory 和寄存器开销的新实现，并先解决 TF32 correction 精度，而不是继续扩大现有原型的 tile 或 warps。
+
+在 workload 分桶和公共启动优化达标后，继续实施了建议文档中的剩余 kernel 实验。满窗口特化使用设备端 `query_len == SPEC_QUERY_LEN` 分支，满窗路径去掉逐 token 判断，ragged 沿用原路径。固定配置 Graph 结果：
+
+| Shape | 当前 | 满窗特化 | 寄存器/spill | 结论 |
+| --- | ---: | ---: | --- | --- |
+| Q4/B32 | 24.291 µs | 25.051 µs | 80 / 0 | 回退 |
+| Q4/B128 | 91.452 µs | 97.467 µs | 128 / 0 | 回退 |
+| Q8/B32 | 41.450 µs | 41.575 µs | 168 / 0 | 回退 |
+
+双路径静态展开增加了代码开销，去掉逐 token 判断没有形成收益。归约布局检查显示，Q4/Q8 的 state tile 均为 `threadsPerWarp=[1,32]`、`warpsPerCTA=[N,1]`，已经是一条 warp 完成一行 K 维归约。TTGIR 中剩余的 layout conversion 主要服务于输出和 records 存储，不存在需要强制单 warp 行归约来消除的额外通信，因此不再实施该改写。本轮没有新增生产代码改动，第 3 节性能表保持有效。
 
 ## 7. 复现命令
 
