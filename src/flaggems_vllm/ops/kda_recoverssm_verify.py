@@ -130,9 +130,14 @@ def _kda_recoverssm_verify_kernel(
 
     offs_k = tl.arange(0, BK)
     offs_v = pid_v * BV + tl.arange(0, BV)
-    mask_k = offs_k < K
-    mask_v = offs_v < V
-    mask_state = mask_v[:, None] & mask_k[None, :]
+    if SPEC_QUERY_LEN >= 4 and K == BK and V % BV == 0:
+        mask_k = True
+        mask_v = True
+        mask_state = True
+    else:
+        mask_k = offs_k < K
+        mask_v = offs_v < V
+        mask_state = mask_v[:, None] & mask_k[None, :]
 
     if state_idx <= null_block_id:
         for token_offset in tl.static_range(SPEC_QUERY_LEN):
