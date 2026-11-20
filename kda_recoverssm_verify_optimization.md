@@ -222,6 +222,18 @@ NCU SpeedUp 为 `native NCU duration / Gems NCU duration`。Occupancy 为 achiev
 
 双路径静态展开增加了代码开销，去掉逐 token 判断没有形成收益。归约布局检查显示，Q4/Q8 的 state tile 均为 `threadsPerWarp=[1,32]`、`warpsPerCTA=[N,1]`，已经是一条 warp 完成一行 K 维归约。TTGIR 中剩余的 layout conversion 主要服务于输出和 records 存储，不存在需要强制单 warp 行归约来消除的额外通信，因此不再实施该改写。本轮没有新增生产代码改动，第 3 节性能表保持有效。
 
+针对 Q2/B32 eager 偶尔接近 0.89 的边界波动，补充 12 轮配对复测：默认 `out` 的 SpeedUp 为 0.911–0.939，中位数 0.924；预分配 `out` 为 0.907–0.931，中位数 0.919。两种方式的绝对延迟均下降，但预分配没有显著扩大相对余量。默认 `out` 时 native/Gems 主机提交中位数为 48.72/56.43 µs，Gems 仍多约 7.7 µs，而 NCU 设备 kernel 已领先约 2.5 µs，因此波动主要来自主机路径。
+
+分别重试了设备和主机优化：
+
+| 方向 | 当前 | 试验 | 结论 |
+| --- | --- | --- | --- |
+| Q2/B32，固定 BV64 外提 `dt_bias` | Graph 14.161 µs，eager 69.056 µs | Graph 14.967 µs，eager 69.856 µs | 回退 |
+| Q2/B256，固定 BV64 外提 `dt_bias` | Graph 104.818 µs，eager 162.128 µs | Graph 108.869 µs，eager 166.352 µs | 回退 |
+| Q2/B32，批量构造 LibEntry 参数字典 | 主机 56.4 µs，eager 72.5 µs | 主机 57.1 µs，eager 72.6 µs | 无稳定收益，回退 |
+
+这些试验均未修改生产代码。在不引入 fast-launch 的前提下，当前公共主机路径已接近本轮可安全兑现的收益上限；第 3 节性能表继续保持有效。
+
 ## 7. 复现命令
 
 当前容器需要把 CUDA compat library 放在 `LD_LIBRARY_PATH` 前面。以下命令使用 GPU 4，并用内存 SQLite 避免持久化调优缓存影响结果。
