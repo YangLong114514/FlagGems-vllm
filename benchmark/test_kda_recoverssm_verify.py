@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-"""KDA RecoverSSM verify: native/Gems pairs timed with device events.
+"""KDA RecoverSSM verify: native/Gems pairs timed eagerly or with CUDA Graph.
 
 Both kernels write ``out`` and the verify records deterministically on every
 call and never mutate the checkpoint pool, so no per-sample state restore is
@@ -15,7 +15,7 @@ import torch
 
 import flaggems_vllm as gems
 from baseline import kda_recoverssm_verify as baseline
-from benchmark.base import Benchmark
+from benchmark.base import Benchmark, do_bench_cudagraph
 from benchmark.conftest import Config
 from benchmark.consts import BenchMode
 from flaggems_vllm.runtime import torch_device_fn
@@ -27,6 +27,11 @@ from tests.test_kda_recoverssm_verify import (
 
 
 def _measure(fn, data):
+    if Config.mode == BenchMode.CUDAGRAPH:
+        latency = do_bench_cudagraph(
+            lambda: fn(**data), rep=Config.repetition, return_mode="median"
+        )
+        return [latency]
     for _ in range(5):
         fn(**data)
     torch_device_fn.synchronize()
@@ -55,13 +60,6 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
     def set_shapes(self, shape_file_path=None):
         self.shapes = self.DEFAULT_SHAPES
 
-    def init_user_config(self):
-        if Config.mode != BenchMode.KERNEL:
-            raise ValueError(
-                "RecoverSSM verify uses --mode kernel with no-Graph device events"
-            )
-        super().init_user_config()
-
     def run(self):
         self.native_op = baseline.native()
         super().run()
@@ -84,13 +82,18 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
 
     def _measure_pair(self, data):
         expected, ref_corr, written = reference(self.case, data)
+        use_graph = Config.mode == BenchMode.CUDAGRAPH
         row = dict(
             case=self.case.name,
             dtype=str(self.dtype),
             backend=gems.vendor_name,
-            graph=False,
+            graph=use_graph,
             unit="ms",
-            protocol="device-event-5warmup-25sample-median",
+            protocol=(
+                f"cuda-graph-replay-median-rep{Config.repetition}ms"
+                if use_graph
+                else "device-event-5warmup-25sample-median"
+            ),
             config=baseline.config({"case": self.case}, self.dtype),
             candidate_accuracy="NOT_RUN",
             native_accuracy="NOT_RUN",
