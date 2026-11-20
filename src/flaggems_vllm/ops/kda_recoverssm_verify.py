@@ -21,7 +21,6 @@ from flaggems_vllm.utils import libentry, libtuner
 # Matches vllm.v1.attention.backends.utils.NULL_BLOCK_ID; requests whose
 # checkpoint slot is <= null_block_id have no state and produce zero outputs.
 DEFAULT_NULL_BLOCK_ID = 0
-_TUNED_CONFIGS = {}
 
 @triton.jit
 def _kda_gate(
@@ -363,7 +362,7 @@ def kda_recoverssm_verify(
         batch,
         num_heads,
     )
-    arguments = (
+    _kda_recoverssm_verify_kernel[grid](
         q,
         k,
         v,
@@ -380,8 +379,6 @@ def kda_recoverssm_verify(
         gate_lower_bound,
         null_block_id,
         *strides,
-    )
-    constexprs = dict(
         K=key_dim,
         V=value_dim,
         BK=block_k,
@@ -389,22 +386,4 @@ def kda_recoverssm_verify(
         USE_LOWER_BOUND=use_lower_bound,
         WORKLOAD_BUCKET=workload_bucket,
     )
-    tuning_key = (key_dim, value_dim, spec_query_len, workload_bucket)
-    launch_config = _TUNED_CONFIGS.get(tuning_key)
-    if launch_config is None:
-        _, tuned = _kda_recoverssm_verify_kernel[grid](*arguments, **constexprs)
-        launch_config = {
-            "BV": tuned["BV"],
-            "num_warps": tuned["num_warps"],
-            "num_stages": tuned["num_stages"],
-            "num_ctas": tuned["num_ctas"],
-        }
-        maxnreg = _kda_recoverssm_verify_kernel.fn.best_config.maxnreg
-        if maxnreg is not None:
-            launch_config["maxnreg"] = maxnreg
-        _TUNED_CONFIGS[tuning_key] = launch_config
-    else:
-        _kda_recoverssm_verify_kernel.jit_function[grid](
-            *arguments, **constexprs, **launch_config
-        )
     return out
