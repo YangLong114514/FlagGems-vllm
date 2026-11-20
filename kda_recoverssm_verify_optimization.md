@@ -109,27 +109,24 @@ Q2 分桶前的首次调优顺序实验：
 
 92 项功能测试通过。仅应用分桶时，Kernel 模式两轮复测中 Q2/B256 SpeedUp 为 0.999/1.000，Q8 为 1.017/1.000；小 batch eager 仍有波动，Q2/B32 为 0.820/0.825，Q4/B32 为 0.890/0.883。对应 Graph 没有回退，该现象促成了第 2.6 节的主机提交优化。
 
-### 2.6 公共 LibEntry 启动路径
+### 2.6 算子内 JIT 调优配置复用
 
-针对 Q2/Q4 小 batch 的 eager 门槛，NCU 显示设备端已经领先：Q2/B32 的 native/Gems kernel 为 24.67/22.14 µs，Q4/B32 为 43.07/34.98 µs，均无 spill。因此本轮优化目标是主机提交路径，而不是继续修改递推计算。
+针对 Q2/Q4 小 batch 的 eager 门槛，NCU 显示设备端已经领先：Q2/B32 的 native/Gems kernel 为 24.67/22.14 µs，Q4/B32 为 43.07/34.98 µs，均无 spill。因此优化目标是主机提交路径，而不是继续修改递推计算。
 
-cProfile 确认额外开销集中在 `LibEntry` 的参数归类、特化键和启动封装。曾试验去掉 `LibEntry`、每次直接经过 `LibTuner + JITFunction`，但该路径需要重复查询调优配置并执行完整 JIT 绑定，主机延迟超过 1.5 ms，已排除。
+cProfile 确认额外开销集中在 `LibEntry` 的参数归类、特化键和启动封装。曾试验修改公共 `LibEntry` 并取得 eager 收益，但考虑公共组件的审核约束，这些改动已全部撤回，`src/flaggems_vllm/utils/libentry.py` 恢复原实现。每次直接经过 `LibTuner + JITFunction` 的方案也因重复查询调优配置而超过 1.5 ms，未采用。
 
-最终保留的是公共 `LibEntry` 的等价 Python 优化：
+当前保留方案只修改 `kda_recoverssm_verify.py`：首次调用仍通过现有 `libentry/libtuner` 编译和选配置，然后按 `(K, V, SPEC_QUERY_LEN, WORKLOAD_BUCKET)` 保存 `BV/warps/stages/ctas/maxnreg`。后续调用把该配置交给标准 Triton `JITFunction`，由 JIT 每次重新处理 dtype、指针对齐、设备、stream 和 `USE_LOWER_BOUND`。不缓存 `CudaLauncher`、函数指针、packed metadata 或 stream，不是历史 fast-launch 实现。
 
-- 参数索引集合替代线性列表查找，并缓存参数名。
-- NVIDIA 路径内联 tensor 的 dtype/alignment 特化键，减少每个参数的嵌套函数调用。
-- do-not-specialize 参数的类型键改为直接生成。
-- 使用普通 dict 保存有序参数，保持 Python 3.8+ 的插入顺序语义。
+固定输入、预分配 `out` 的同轮对照：
 
-没有新增 fast-launch 或直接 `CudaLauncher` 缓存，首次调用仍通过现有 `libentry/libtuner` 编译和选配置。固定输入、预分配 `out` 的 Gems 对照：
-
-| Shape | 修改前主机提交 | 修改后主机提交 | 修改前 eager event | 修改后 eager event |
+| Shape | Native 主机提交 | Gems 主机提交 | Native eager | Gems eager |
 | --- | ---: | ---: | ---: | ---: |
-| Q2/B32 | 60.83 µs | 52.57 µs | 76.72 µs | 68.94 µs |
-| Q4/B32 | 61.53 µs | 53.72 µs | 87.79 µs | 79.76 µs |
+| Q2/B32 | 45.49 µs | 48.31 µs | 63.71 µs | 65.47 µs |
+| Q4/B32 | 45.89 µs | 48.09 µs | 78.19 µs | 76.08 µs |
 
-同轮 native/Gems eager event 分别为：Q2/B32 72.40/68.94 µs，Q4/B32 77.09/79.76 µs，SpeedUp 均高于 0.9。完整生产回归中，十组 eager SpeedUp 为 0.907–1.196，全部达到仓库门槛；Graph 结果与仅分桶时一致。功能验证包括 KDA 92 项测试，以及同样经过 `LibEntry` 的 `grouped_topk` 21 项 quick 测试，均通过。
+Graph 延迟保持为 Q2/B32 14.03 µs、Q4/B32 24.84 µs。新增回归测试在同一调优 key 下交替 `lower_bound=None/0.0/-5.0`，并在非默认 stream 上与 native 对拍；完整生产测试另覆盖 Graph 捕获。KDA 93 项测试通过，双 H800 设备间复用同一调优配置也分别与 native 对拍通过。最终十组 eager SpeedUp 为 0.970–1.247，Graph 为 1.079–1.414。
+
+一轮完整 Graph 测试曾因首次 autotune 波动使 Q8 达到 48.37 µs；复测为 41.86 µs，三个独立进程也均选择 BV32/2 warps 并得到约 40.94 µs。该现象与既有 eager 调优/Graph 排名差异一致，不是标准 JIT 路径的稳定回退，但首次调优波动仍是残余风险。
 
 ## 3. 当前生产 Shape 性能
 
@@ -137,22 +134,22 @@ SpeedUp 定义为 `vLLM latency / FlagGems latency`，数值越大越好。Kerne
 
 | Case | Kernel vLLM | Kernel Gems | Kernel SpeedUp | Graph vLLM | Graph Gems | Graph SpeedUp |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| k3_tp8_mtp1_bs32 | 0.067968 | 0.074944 | 0.907 | 0.015347 | 0.014103 | 1.088 |
-| k3_tp8_mtp1_bs128 | 0.116960 | 0.115424 | 1.013 | 0.063718 | 0.055588 | 1.146 |
-| k3_tp8_mtp1_bs256 | 0.169984 | 0.163168 | 1.042 | 0.116752 | 0.101566 | 1.150 |
-| k3_tp8_spec3_bs32 | 0.082272 | 0.085120 | 0.967 | 0.029534 | 0.024842 | 1.189 |
-| k3_tp8_spec3_bs128 | 0.182048 | 0.152512 | 1.194 | 0.129672 | 0.091940 | 1.410 |
-| k3_tp8_win8_bs32 | 0.111040 | 0.102368 | 1.085 | 0.058423 | 0.041478 | 1.409 |
-| k3_tp4_mtp1_bs64 | 0.117184 | 0.116064 | 1.010 | 0.064862 | 0.055904 | 1.160 |
-| k3_tp2_mtp1_bs64 | 0.171200 | 0.163296 | 1.048 | 0.117764 | 0.101980 | 1.155 |
-| k3_tp1_mtp1_bs8 | 0.091072 | 0.092064 | 0.989 | 0.038074 | 0.031245 | 1.219 |
-| k3_tp1_spec3_bs16 | 0.182368 | 0.152512 | 1.196 | 0.129904 | 0.091812 | 1.415 |
+| k3_tp8_mtp1_bs32 | 0.067712 | 0.069824 | 0.970 | 0.015260 | 0.014148 | 1.079 |
+| k3_tp8_mtp1_bs128 | 0.117056 | 0.112224 | 1.043 | 0.064195 | 0.055546 | 1.156 |
+| k3_tp8_mtp1_bs256 | 0.169696 | 0.157472 | 1.078 | 0.116543 | 0.101133 | 1.152 |
+| k3_tp8_spec3_bs32 | 0.082304 | 0.079616 | 1.034 | 0.029389 | 0.024959 | 1.177 |
+| k3_tp8_spec3_bs128 | 0.181248 | 0.146208 | 1.240 | 0.129554 | 0.091807 | 1.411 |
+| k3_tp8_win8_bs32 | 0.112832 | 0.104096 | 1.084 | 0.058772 | 0.041860 | 1.404 |
+| k3_tp4_mtp1_bs64 | 0.116128 | 0.110720 | 1.049 | 0.064899 | 0.055940 | 1.160 |
+| k3_tp2_mtp1_bs64 | 0.171040 | 0.156960 | 1.090 | 0.117060 | 0.102020 | 1.147 |
+| k3_tp1_mtp1_bs8 | 0.090144 | 0.085024 | 1.060 | 0.038267 | 0.031379 | 1.220 |
+| k3_tp1_spec3_bs16 | 0.181504 | 0.145504 | 1.247 | 0.129780 | 0.091757 | 1.414 |
 
 这张表是当前实现相对 vLLM 的最终结果，不能全部归因于某一项代码改动。Q8 外提、guarded token、精确 tile 和 workload 分桶的增量分别见第 2.1、2.2、2.3 和 2.5 节。
 
 ## 4. NCU profile 与瓶颈评估
 
-使用 NCU 2025.4.1 对十组生产用例分别采集 native 和 Gems 的 full profile。每次只采集一个目标 kernel，排除 autotune、参考实现和其他框架 kernel。NCU 默认 flush cache 并通过多 pass replay 收集指标，因此下表延迟用于硬件瓶颈分析，不与 CUDA Graph 延迟直接混用。数据采集于 workload 分桶和公共启动优化之前；其中 Q2/B32、Q4/B32 的设备配置与后续 eager 分析一致，其他 Shape 的最终性能以第 3 节为准。
+使用 NCU 2025.4.1 对十组生产用例分别采集 native 和 Gems 的 full profile。每次只采集一个目标 kernel，排除 autotune、参考实现和其他框架 kernel。NCU 默认 flush cache 并通过多 pass replay 收集指标，因此下表延迟用于硬件瓶颈分析，不与 CUDA Graph 延迟直接混用。数据采集于 workload 分桶和算子内启动优化之前；其中 Q2/B32、Q4/B32 的设备配置与后续 eager 分析一致，其他 Shape 的最终性能以第 3 节为准。
 
 NCU SpeedUp 为 `native NCU duration / Gems NCU duration`。Occupancy 为 achieved occupancy，Registers 单位为 register/thread。
 

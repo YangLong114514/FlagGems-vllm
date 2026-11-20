@@ -151,6 +151,28 @@ def test_gems_matches_native(case, dtype, state_dtype):
     assert torch.equal(gems_inputs["checkpoint_state"], checkpoint_before)
 
 
+def test_tuned_config_reuse_on_stream_and_gate_modes():
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for lower_bound in (None, 0.0, -5.0, None):
+            case = Case(
+                "reused_config", [2] * 32, window=2, heads=12, lower_bound=lower_bound
+            )
+            native_inputs = build(case, torch.bfloat16, "cuda")
+            gems_inputs = build(case, torch.bfloat16, "cuda")
+            native_out = NATIVE(**native_inputs)
+            gems_out = gems.kda_recoverssm_verify(**gems_inputs)
+            torch.testing.assert_close(gems_out, native_out, rtol=2e-2, atol=2e-2)
+            for b, length in enumerate(case.lengths):
+                native_corr = native_inputs["records"].correction[b, :, :length]
+                gems_corr = gems_inputs["records"].correction[b, :, :length]
+                torch.testing.assert_close(gems_corr, native_corr, rtol=1e-4, atol=1e-5)
+                native_kg = native_inputs["records"].key_gate[b, :, :length]
+                gems_kg = gems_inputs["records"].key_gate[b, :, :length]
+                assert torch.equal(gems_kg, native_kg)
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_out_argument_and_duck_typed_records(dtype):
     case = Case("k3_tp8_mtp1_bs32", [2] * 32, window=2, heads=12)
