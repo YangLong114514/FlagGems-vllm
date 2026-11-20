@@ -36,19 +36,30 @@ kernel 按 `(V tile, request, head)` 并行，在每个 program 内沿 speculati
 - Q4 固定配置下寄存器从 64 增至 79，延迟回退约 4%。
 - Q2 固定配置下虽有约 2%–3% 收益，但完整 eager autotune 会误选 BV16，导致 CUDA Graph 性能回退。因此最终只保留收益稳定的 Q8 路径。
 
-### 2.2 V 方向 tiling 与 autotune
+### 2.2 token 有效性改用标量控制流
+
+原实现为窗口内每个 token 执行 masked load、完整 recurrent 计算、masked store 和 `tl.where`，即使 `token_offset >= query_len` 也不会跳过计算。现在保留 `tl.static_range` 静态展开，但用 `if token_offset < query_len` 包围整个 token body：
+
+- 满窗口生产路径不再需要 `token_valid` 对每次加载和存储进行谓词控制，也不再执行 state 选择。
+- ragged window 直接跳过剩余 token，不再执行无效 recurrent 计算。
+- 不使用已经验证会变慢的动态 token 循环。
+
+固定配置的 CUDA Graph 对照结果：
+
+| Shape | 修改前 | 修改后 | 延迟改善 |
+| --- | ---: | ---: | ---: |
+| Q2, B32 | 15.436 µs | 14.432 µs | 6.5% |
+| Q2, B256 | 113.035 µs | 104.701 µs | 7.4% |
+| Q4, B128 | 123.734 µs | 122.148 µs | 1.3% |
+| Q8, B32 | 56.009 µs | 49.787 µs | 11.1% |
+
+完整 autotune 和生产 benchmark 中，CUDA Graph 的 10 组生产 Shape 全部提升 5.8%–19.6%，Kernel 模式也全部提升。Q8 固定配置的编译结果从 116 降至 104 registers/thread，无 spill。92 项功能测试全部通过，覆盖 ragged window 和 NULL checkpoint。
+
+### 2.3 V 方向 tiling 与 autotune
 
 当前 kernel 通过 `BV`、`num_warps`、`num_stages` 调节 state tile、并行度和寄存器占用，配置位于 `src/flaggems_vllm/runtime/backend/_nvidia/tune_configs.yaml`。vLLM 基线固定 `BV=32, num_warps=4, num_stages=2`，FlagGems 按 `(K, V, SPEC_QUERY_LEN)` 及输入 dtype 选择配置。
 
-在本轮代表性 Shape 上，最终常用配置为：
-
-| 窗口 | BV | num_warps | num_stages |
-| --- | ---: | ---: | ---: |
-| Q2 | 64 | 8 | 2 |
-| Q4 | 32 | 8 | 2 |
-| Q8 | 64 | 8 | 2 |
-
-更大的 BV 可以减少不同 V tile 对 `q/k/raw_g` 的重复加载和归一化计算，但并非越大越好。BV128 的编译结果达到 255 registers/thread，只有很低的 occupancy，性能明显下降。调优的目标应是实际延迟，而不是单纯减少 CTA 或重复指令。
+更大的 BV 可以减少不同 V tile 对 `q/k/raw_g` 的重复加载和归一化计算，但并非越大越好。guarded token 改动前的 BV128 编译结果曾达到 255 registers/thread，occupancy 和性能明显下降；改动后的最优配置会随 kernel 和首个调优 Shape 改变，不能为同一 window 类别假定永久固定的配置。调优的目标应是目标执行模式的实际延迟，而不是单纯减少 CTA 或重复指令。
 
 ## 3. 当前生产 Shape 性能
 
@@ -56,18 +67,18 @@ SpeedUp 定义为 `vLLM latency / FlagGems latency`，数值越大越好。Kerne
 
 | Case | Kernel vLLM | Kernel Gems | Kernel SpeedUp | Graph vLLM | Graph Gems | Graph SpeedUp |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| k3_tp8_mtp1_bs32 | 0.067680 | 0.081408 | 0.831 | 0.015342 | 0.015409 | 0.996 |
-| k3_tp8_mtp1_bs128 | 0.116064 | 0.125344 | 0.926 | 0.063802 | 0.060009 | 1.063 |
-| k3_tp8_mtp1_bs256 | 0.168640 | 0.178976 | 0.942 | 0.116957 | 0.113014 | 1.035 |
-| k3_tp8_spec3_bs32 | 0.082304 | 0.097952 | 0.840 | 0.029415 | 0.032429 | 0.907 |
-| k3_tp8_spec3_bs128 | 0.180448 | 0.188960 | 0.955 | 0.129433 | 0.124164 | 1.042 |
-| k3_tp8_win8_bs32 | 0.112256 | 0.122688 | 0.915 | 0.059176 | 0.056463 | 1.048 |
-| k3_tp4_mtp1_bs64 | 0.116320 | 0.125920 | 0.924 | 0.065053 | 0.060078 | 1.083 |
-| k3_tp2_mtp1_bs64 | 0.171808 | 0.178208 | 0.964 | 0.118586 | 0.112613 | 1.053 |
-| k3_tp1_mtp1_bs8 | 0.089760 | 0.097824 | 0.918 | 0.038381 | 0.033392 | 1.149 |
-| k3_tp1_spec3_bs16 | 0.181952 | 0.190272 | 0.956 | 0.129974 | 0.124288 | 1.046 |
+| k3_tp8_mtp1_bs32 | 0.067040 | 0.079968 | 0.838 | 0.015277 | 0.014034 | 1.089 |
+| k3_tp8_mtp1_bs128 | 0.115936 | 0.122080 | 0.950 | 0.063680 | 0.055533 | 1.147 |
+| k3_tp8_mtp1_bs256 | 0.169216 | 0.171392 | 0.987 | 0.116972 | 0.104866 | 1.115 |
+| k3_tp8_spec3_bs32 | 0.081888 | 0.091456 | 0.895 | 0.029412 | 0.026066 | 1.128 |
+| k3_tp8_spec3_bs128 | 0.181056 | 0.168576 | 1.074 | 0.129407 | 0.102060 | 1.268 |
+| k3_tp8_win8_bs32 | 0.111168 | 0.116160 | 0.957 | 0.059164 | 0.050123 | 1.180 |
+| k3_tp4_mtp1_bs64 | 0.115616 | 0.120576 | 0.959 | 0.065048 | 0.055824 | 1.165 |
+| k3_tp2_mtp1_bs64 | 0.170816 | 0.170368 | 1.003 | 0.118187 | 0.104117 | 1.135 |
+| k3_tp1_mtp1_bs8 | 0.089920 | 0.095744 | 0.939 | 0.038370 | 0.031448 | 1.220 |
+| k3_tp1_spec3_bs16 | 0.182464 | 0.167872 | 1.087 | 0.129408 | 0.102108 | 1.267 |
 
-这张表是当前实现相对 vLLM 的最终结果，不能全部归因于某一项代码改动。Q8 外提的独立增量见第 2.1 节。
+这张表是当前实现相对 vLLM 的最终结果，不能全部归因于某一项代码改动。Q8 外提的独立增量见第 2.1 节，guarded token 的固定配置增量见第 2.2 节。
 
 ## 4. 已验证无效并回退的方案
 
@@ -78,7 +89,9 @@ SpeedUp 定义为 `vLLM latency / FlagGems latency`，数值越大越好。Kerne
 | `static_range` 改动态 token 循环 | 慢约 6%–22% | 回退 |
 | 交换 batch/head 的 CTA 调度顺序 | 基本无收益，部分 Shape 略慢 | 回退 |
 | 将两次 state-vector 归约直接替换为 `tl.dot` | 慢约 3–50 倍；IEEE 路径出现大量 spill | 回退 |
-| 使用 BV128 消除跨 V tile 的重复计算 | 255 registers/thread，occupancy 受限，性能下降 | 不作为默认配置 |
+| 改写输出代数关系以打破更新后 state 的依赖 | 增加额外归约，慢约 3%–12% | 回退 |
+| state 使用 `.cg` 或 activation 使用 `evict_last` | 基本无收益或略慢 | 回退 |
+| 使用 BV128 消除跨 V tile 的重复计算 | 原 kernel 达到 255 registers/thread，occupancy 受限，性能下降 | 不作为固定默认配置 |
 
 这些结果说明，后续优化不应只做局部指令替换或盲目扩大 tile。每次试验都应固定一个主要变量，并分别验证 Kernel 和 CUDA Graph。
 

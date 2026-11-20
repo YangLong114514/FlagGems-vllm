@@ -159,87 +159,87 @@ def _kda_recoverssm_verify_kernel(
         ).to(tl.float32)
 
     for token_offset in tl.static_range(SPEC_QUERY_LEN):
-        token_valid = token_offset < query_len
-        token = bos + token_offset
-        q = tl.load(
-            q_ptr + token * stride_q_token + pid_h * K + offs_k,
-            mask=token_valid & mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        k = tl.load(
-            k_ptr + token * stride_k_token + pid_h * K + offs_k,
-            mask=token_valid & mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        v = tl.load(
-            v_ptr + token * stride_v_token + pid_h * V + offs_v,
-            mask=token_valid & mask_v,
-            other=0.0,
-        ).to(tl.float32)
-        raw_g = tl.load(
-            raw_g_ptr + token * stride_g_token + pid_h * K + offs_k,
-            mask=token_valid & mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        raw_beta = tl.load(
-            raw_beta_ptr + token * stride_beta_token + pid_h,
-            mask=token_valid,
-            other=0.0,
-        ).to(tl.float32)
-
-        q *= tl.rsqrt(tl.sum(q * q) + 1e-6) * (K**-0.5)
-        if SPEC_QUERY_LEN != 8:
-            dt_bias = tl.load(
-                dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0
+        if token_offset < query_len:
+            token = bos + token_offset
+            q = tl.load(
+                q_ptr + token * stride_q_token + pid_h * K + offs_k,
+                mask=mask_k,
+                other=0.0,
             ).to(tl.float32)
-        updated_state, correction = _kda_recurrent_step(
-            state,
-            k,
-            v,
-            raw_g,
-            raw_beta,
-            dt_bias,
-            A,
-            lower_bound,
-            USE_LOWER_BOUND,
-        )
-        state = tl.where(token_valid, updated_state, state)
+            k = tl.load(
+                k_ptr + token * stride_k_token + pid_h * K + offs_k,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            v = tl.load(
+                v_ptr + token * stride_v_token + pid_h * V + offs_v,
+                mask=mask_v,
+                other=0.0,
+            ).to(tl.float32)
+            raw_g = tl.load(
+                raw_g_ptr + token * stride_g_token + pid_h * K + offs_k,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            raw_beta = tl.load(
+                raw_beta_ptr + token * stride_beta_token + pid_h,
+                mask=True,
+                other=0.0,
+            ).to(tl.float32)
 
-        out = tl.sum(state * q[None, :], axis=1)
-        tl.store(
-            out_ptr + token * stride_out_token + pid_h * V + offs_v,
-            out,
-            mask=token_valid & mask_v,
-        )
-
-        correction_ptr = (
-            correction_cache_ptr
-            + pid_b * stride_correction_row
-            + pid_h * stride_correction_head
-            + token_offset * stride_correction_pos
-        )
-        tl.store(
-            correction_ptr + offs_v * stride_correction_dim,
-            correction,
-            mask=token_valid & mask_v,
-        )
-        if pid_v == 0:
-            kg_ptr = (
-                kg_cache_ptr
-                + pid_b * stride_kg_row
-                + pid_h * stride_kg_head
-                + token_offset * stride_kg_pos
-            )
-            tl.store(
-                kg_ptr + offs_k * stride_kg_dim,
+            q *= tl.rsqrt(tl.sum(q * q) + 1e-6) * (K**-0.5)
+            if SPEC_QUERY_LEN != 8:
+                dt_bias = tl.load(
+                    dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0
+                ).to(tl.float32)
+            updated_state, correction = _kda_recurrent_step(
+                state,
                 k,
-                mask=token_valid & mask_k,
+                v,
+                raw_g,
+                raw_beta,
+                dt_bias,
+                A,
+                lower_bound,
+                USE_LOWER_BOUND,
+            )
+            state = updated_state
+
+            out = tl.sum(state * q[None, :], axis=1)
+            tl.store(
+                out_ptr + token * stride_out_token + pid_h * V + offs_v,
+                out,
+                mask=mask_v,
+            )
+
+            correction_ptr = (
+                correction_cache_ptr
+                + pid_b * stride_correction_row
+                + pid_h * stride_correction_head
+                + token_offset * stride_correction_pos
             )
             tl.store(
-                kg_ptr + (K + offs_k) * stride_kg_dim,
-                raw_g,
-                mask=token_valid & mask_k,
+                correction_ptr + offs_v * stride_correction_dim,
+                correction,
+                mask=mask_v,
             )
+            if pid_v == 0:
+                kg_ptr = (
+                    kg_cache_ptr
+                    + pid_b * stride_kg_row
+                    + pid_h * stride_kg_head
+                    + token_offset * stride_kg_pos
+                )
+                tl.store(
+                    kg_ptr + offs_k * stride_kg_dim,
+                    k,
+                    mask=mask_k,
+                )
+                tl.store(
+                    kg_ptr + (K + offs_k) * stride_kg_dim,
+                    raw_g,
+                    mask=mask_k,
+                )
 
 
 def kda_recoverssm_verify(
