@@ -71,7 +71,7 @@ def _kda_recurrent_step(
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("kda_recoverssm_verify"),
-    key=["K", "V", "SPEC_QUERY_LEN"],
+    key=["K", "V", "SPEC_QUERY_LEN", "WORKLOAD_BUCKET"],
 )
 @triton.jit
 def _kda_recoverssm_verify_kernel(
@@ -116,6 +116,7 @@ def _kda_recoverssm_verify_kernel(
     BV: tl.constexpr,
     SPEC_QUERY_LEN: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    WORKLOAD_BUCKET: tl.constexpr,
 ):
     pid_v = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -330,6 +331,7 @@ def kda_recoverssm_verify(
         return out
 
     block_k = triton.next_power_of_2(key_dim)
+    workload_bucket = triton.next_power_of_2(batch * num_heads)
     gate_lower_bound = lower_bound or 0.0
     use_lower_bound = lower_bound is not None
     null_block_id = DEFAULT_NULL_BLOCK_ID
@@ -382,5 +384,6 @@ def kda_recoverssm_verify(
         BK=block_k,
         SPEC_QUERY_LEN=spec_query_len,
         USE_LOWER_BOUND=use_lower_bound,
+        WORKLOAD_BUCKET=workload_bucket,
     )
     return out

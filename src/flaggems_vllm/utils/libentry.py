@@ -22,7 +22,6 @@ import multiprocessing
 import os
 import time
 from abc import abstractmethod
-from collections import OrderedDict
 from functools import cached_property
 from itertools import starmap
 from pathlib import Path
@@ -1042,19 +1041,21 @@ class LibEntry(triton.KernelInterface):
         while not isinstance(fn, triton.runtime.JITFunction):
             fn = fn.fn
         self.jit_function: triton.runtime.JITFunction = fn
-        self.specialize_indices = [
+        self.specialize_indices = {
             p.num
             for p in self.jit_function.params
             if not p.is_constexpr and not p.do_not_specialize
-        ]
-        self.do_not_specialize_indices = [
+        }
+        self.do_not_specialize_indices = {
             p.num
             for p in self.jit_function.params
             if not p.is_constexpr and p.do_not_specialize
-        ]
+        }
         self.lock = multiprocessing.Lock()
         self.signature = fn.signature
         self._kernel_params = frozenset(p.name for p in self.jit_function.params)
+        self.param_names = list(self.signature.parameters.keys())
+        self.is_hygon = runtime.device.vendor_name == "hygon"
 
     @staticmethod
     def _contains_flagtune_tuner(fn):
@@ -1118,19 +1119,29 @@ class LibEntry(triton.KernelInterface):
                 return (arg.dtype, arg.data_ptr() % self.divisibility == 0)
             return (type(arg), arg)
 
-        def dns_arg(arg):
-            if hasattr(arg, "data_ptr"):
-                return arg.dtype
-            if not isinstance(arg, int):
-                return type(arg)
-            if -(2**31) <= arg and arg <= 2**31 - 1:
-                return "i32"
-            if 2**63 <= arg and arg <= 2**64 - 1:
-                return "u64"
-            return "i64"
-
-        spec_key = [spec_arg(arg) for arg in spec_args]
-        dns_key = [dns_arg(arg) for arg in dns_args]
+        if self.is_hygon:
+            spec_key = [spec_arg(arg) for arg in spec_args]
+        else:
+            spec_key = [
+                (arg.dtype, arg.data_ptr() % self.divisibility == 0)
+                if hasattr(arg, "data_ptr")
+                else (type(arg), arg)
+                for arg in spec_args
+            ]
+        dns_key = [
+            arg.dtype
+            if hasattr(arg, "data_ptr")
+            else (
+                "i32"
+                if isinstance(arg, int) and -(2**31) <= arg <= 2**31 - 1
+                else (
+                    "u64"
+                    if isinstance(arg, int) and 2**63 <= arg <= 2**64 - 1
+                    else ("i64" if isinstance(arg, int) else type(arg))
+                )
+            )
+            for arg in dns_args
+        ]
         # const args passed by position
         return tuple(spec_key + dns_key + const_args)
 
@@ -1165,8 +1176,8 @@ class LibEntry(triton.KernelInterface):
         spec_args = []  # specialize arguments
         dns_args = []  # do not specialize arguments
         const_args = []  # constexpr arguments
-        k_args = OrderedDict()
-        param_names = list(self.signature.parameters.keys())
+        k_args = {}
+        param_names = self.param_names
         for i, arg in enumerate(args):
             hashable_arg = arg
             if (
