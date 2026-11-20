@@ -95,7 +95,50 @@ SpeedUp 定义为 `vLLM latency / FlagGems latency`，数值越大越好。Kerne
 
 这张表是当前实现相对 vLLM 的最终结果，不能全部归因于某一项代码改动。Q8 外提、guarded token 和精确 tile 的独立增量分别见第 2.1、2.2 和 2.3 节。
 
-## 4. 已验证无效并回退的方案
+## 4. NCU profile 与瓶颈评估
+
+使用 NCU 2025.4.1 对十组生产用例分别采集 native 和 Gems 的 full profile。每次只采集一个目标 kernel，排除 autotune、参考实现和其他框架 kernel。NCU 默认 flush cache 并通过多 pass replay 收集指标，因此下表延迟用于硬件瓶颈分析，不与 CUDA Graph 延迟直接混用。
+
+NCU SpeedUp 为 `native NCU duration / Gems NCU duration`。Occupancy 为 achieved occupancy，Registers 单位为 register/thread。
+
+| Case | Native | Gems | NCU SpeedUp | Gems SM | Gems DRAM | Occupancy | Registers |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| k3_tp8_mtp1_bs32 | 24.67 µs | 22.14 µs | 1.114 | 48.1% | 35.6% | 33.5% | 80 |
+| k3_tp8_mtp1_bs128 | 73.38 µs | 67.04 µs | 1.095 | 62.6% | 48.4% | 35.6% | 80 |
+| k3_tp8_mtp1_bs256 | 134.27 µs | 127.49 µs | 1.053 | 67.5% | 50.6% | 36.0% | 80 |
+| k3_tp8_spec3_bs32 | 43.07 µs | 34.98 µs | 1.231 | 53.3% | 23.5% | 33.8% | 80 |
+| k3_tp8_spec3_bs128 | 150.05 µs | 116.96 µs | 1.283 | 63.6% | 29.3% | 36.0% | 80 |
+| k3_tp8_win8_bs32 | 83.01 µs | 73.50 µs | 1.129 | 38.2% | 12.0% | 18.1% | 168 |
+| k3_tp4_mtp1_bs64 | 74.08 µs | 67.42 µs | 1.099 | 63.0% | 48.1% | 35.6% | 80 |
+| k3_tp2_mtp1_bs64 | 136.00 µs | 126.02 µs | 1.079 | 67.6% | 51.2% | 36.0% | 80 |
+| k3_tp1_mtp1_bs8 | 43.46 µs | 37.73 µs | 1.152 | 56.5% | 43.3% | 34.8% | 80 |
+| k3_tp1_spec3_bs16 | 149.79 µs | 116.61 µs | 1.285 | 63.7% | 29.3% | 36.0% | 80 |
+
+瓶颈分类：
+
+- Q2：global load 的 long-scoreboard stall 约占 14%–27%，warp reduction 相关的 short-scoreboard stall 约占 14%–17%。大 batch 的 SM、DRAM 和 L2 利用率同时较高，不再是单一资源瓶颈。
+- Q4：DRAM 仅约 23%–29%，short-scoreboard stall 约 18%–20%，主要空间在归约和指令调度。当前 80 registers/thread 对应 37.5% 理论 occupancy，没有 spill。
+- Q8：当前 NCU 配置为 BV32、2 warps、168 registers/thread，理论/实际 occupancy 仅 18.75%/18.1%。每个 scheduler 平均只有 0.66 个 eligible warp，约 61% 周期没有可发射 warp，no-instruction stall 约 18.5%。DRAM 仅 12%，主要矛盾是低 occupancy、串行 recurrent 依赖和归约延迟。
+
+基于上述数据执行的后续试验结果如下。延迟均为固定配置的 CUDA Graph 延迟，与 NCU replay 延迟口径不同。
+
+| 试验 | 当前延迟 | 试验延迟 | 编译结果 | 结论 |
+| --- | ---: | ---: | --- | --- |
+| Q8：BV32/2 warps 改 4 warps | 41.06 µs | 48.33 µs | 168 → 95 registers，无 spill | 回退 |
+| Q8：`maxnreg=128` | 41.06 µs | 48.39 µs | 168 → 128 registers，无 spill | 回退 |
+| Q8：BV64/8 warps | 41.06 µs | 48.57 µs | 80 registers，无 spill | 回退 |
+| Q2 B32：`maxnreg=64` | 14.10 µs | 15.22 µs | 64 registers，2 次 spill | 回退 |
+| Q2 B256：`maxnreg=64` | 104.81 µs | 105.42 µs | 64 registers，2 次 spill | 回退 |
+| Q4 B32：`maxnreg=64` | 24.86 µs | 28.47 µs | 64 registers，14 次 spill | 回退 |
+| Q4 B128：`maxnreg=64` | 97.40 µs | 102.97 µs | 64 registers，14 次 spill | 回退 |
+
+提高理论 occupancy 并不等于降低延迟。Q8 的当前 2-warp 实现虽然 occupancy 低，但归约和指令调度更高效；Q2/Q4 的寄存器限制则直接引入 spill，抵消了 occupancy 收益。
+
+随后实现了 Q8 窗口级公式原型：一次求出窗口内所有 correction，再由初始 state 和 correction 组合计算输出，避免逐 token 物化完整中间 state。最佳原型使用 BV32/2 warps，延迟 104.90 µs，而当前为 40.89 µs；需要 16KB shared memory，达到 255 registers/thread 并出现 40 次 spill。TF32 路径的 correction 最大绝对误差约 4.08e-5，也还需要进一步验证。该原型不保留，现有逐 token kernel 继续作为当前最优实现。
+
+原始报告和汇总数据保存在开发机的 `/workspace/kda_ncu_reports/`，包括 20 份 `.ncu-rep`、`summary.csv` 和 `summary.json`。
+
+## 5. 已验证无效并回退的方案
 
 | 方案 | 结果 | 处理 |
 | --- | --- | --- |
@@ -110,13 +153,11 @@ SpeedUp 定义为 `vLLM latency / FlagGems latency`，数值越大越好。Kerne
 
 这些结果说明，后续优化不应只做局部指令替换或盲目扩大 tile。每次试验都应固定一个主要变量，并分别验证 Kernel 和 CUDA Graph。
 
-## 5. 后续优化方向
+## 6. 后续优化方向
 
-Q8 可继续评估窗口级公式重构：利用 cumulative decay 和窗口内的 `k_i·k_j`、`q_i·k_j` 关系，一次求出多个 token 的 correction，再由初始 checkpoint 和 correction 组合计算输出，避免逐 token 物化完整中间 state。
+本轮 NCU 导向的 occupancy 调整和窗口级公式原型均未通过性能验收，当前没有新增保留项。后续不应直接重复这些配置；若重新启动 Q8 深度优化，需要能显著降低窗口内 pairwise 计算、布局转换、shared memory 和寄存器开销的新实现，并先解决 TF32 correction 精度，而不是继续扩大现有原型的 tile 或 warps。
 
-该方向可能减少串行 state 操作，但需要重新处理数值精度、矩阵布局转换和寄存器压力。直接替换为 `tl.dot` 已证明无效，只有完整窗口级实现能够摊薄这些成本时才值得继续。它目前仍是待验证方向，不属于已交付优化。
-
-## 6. 复现命令
+## 7. 复现命令
 
 当前容器需要把 CUDA compat library 放在 `LD_LIBRARY_PATH` 前面。以下命令使用 GPU 4，并用内存 SQLite 避免持久化调优缓存影响结果。
 
