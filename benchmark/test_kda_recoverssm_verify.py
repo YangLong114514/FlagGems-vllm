@@ -30,7 +30,10 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
             self.case = cases[name]
             self.dtype = dtype
             self.reference_data = None
-            yield (baseline.build(self.case, dtype, self.device),)
+            inputs = baseline.build(
+                self.case, dtype, self.device, vendor=gems.vendor_name
+            )
+            yield (inputs,)
 
     def record_shapes(self, *args, **kwargs):
         return dict(case=self.case.name, inputs=super().record_shapes(*args, **kwargs))
@@ -55,7 +58,7 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
 def test_kda_recoverssm_verify():
     KDARecoverSSMVerifyBenchmark(
         op_name=baseline.OP_NAME,
-        torch_op=baseline.native(),
+        torch_op=baseline.native(gems.vendor_name),
         gems_op=gems.kda_recoverssm_verify,
         is_inplace=baseline.IS_INPLACE,
     ).run()

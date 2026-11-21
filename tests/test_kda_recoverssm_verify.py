@@ -9,20 +9,23 @@ against the interface contract of the vLLM kernel.
 """
 
 import types
+from functools import partial
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 import flaggems_vllm as gems
-from baseline.kda_recoverssm_verify import PERF_CASES, Case, build, native
+from baseline import kda_recoverssm_verify as baseline
+from baseline.kda_recoverssm_verify import PERF_CASES, Case
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.kda_recoverssm_verify,
 ]
 
-NATIVE = native()
+NATIVE = baseline.native(gems.vendor_name)
+build = partial(baseline.build, vendor=gems.vendor_name)
 DTYPES = [torch.float16, torch.bfloat16]
 PRECISIONS = [
     pytest.param(torch.bfloat16, torch.float32, id="bf16_activation_fp32_state"),
