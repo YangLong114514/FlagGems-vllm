@@ -1,16 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 FlagOS Contributors
-"""Native vLLM KDA RecoverSSM speculative-verify workloads and signatures."""
+"""Native vLLM KDA RecoverSSM speculative-verify workloads and signatures.
+
+On MetaX, opt into the bundled vLLM v0.34.0 Triton verify before collection:
+
+    export FLAGGEMS_METAX_KDA_VLLM034_BASELINE=1
+    python -m pytest -q tests/test_kda_recoverssm_verify.py
+    python -m pytest -q -s benchmark/test_kda_recoverssm_verify.py --level core
+
+With this setting, SpeedUp is the local v0.34.0 latency divided by the
+FlagGems latency on the same device.
+"""
 
 import math
+import os
 from typing import NamedTuple, Optional
 
 import torch
-from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
-    KDARecoverSSMRecords,
-    kda_recoverssm_verify as _native,
-)
-from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+
+def _use_metax_v034_baseline():
+    if os.getenv("FLAGGEMS_METAX_KDA_VLLM034_BASELINE") != "1":
+        return False
+    from flaggems_vllm import vendor_name
+
+    return vendor_name == "metax"
+
+
+_USE_METAX_V034_BASELINE = _use_metax_v034_baseline()
+if _USE_METAX_V034_BASELINE:
+    from baseline.metax.kda_recoverssm_verify_v034 import (
+        NULL_BLOCK_ID,
+        KDARecoverSSMRecords,
+        kda_recoverssm_verify as _native,
+    )
+else:
+    from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+        KDARecoverSSMRecords,
+        kda_recoverssm_verify as _native,
+    )
+    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 OP_NAME = "kda_recoverssm_verify"
 DTYPES = [torch.float16, torch.bfloat16]
@@ -79,6 +108,10 @@ def build(case, dtype, device, state_dtype=torch.float32):
     h, d = case.heads, case.head_dim
 
     def rand(shape, dt=dtype, scale=0.2):
+        if _USE_METAX_V034_BASELINE:
+            # Form [1,T,H,D] after transfer so the head/dim strides are (D,1).
+            flat = torch.randn(math.prod(shape), generator=gen)
+            return (flat * scale).to(dt).to(device).view(shape)
         return (torch.randn(shape, generator=gen) * scale).to(dt).to(device)
 
     q = rand((1, total, h, d))
