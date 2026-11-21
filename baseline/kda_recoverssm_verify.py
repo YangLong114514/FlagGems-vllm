@@ -2,44 +2,14 @@
 # Copyright 2026 FlagOS Contributors
 """Native vLLM KDA RecoverSSM speculative-verify workloads and signatures.
 
-On MetaX, opt into the bundled vLLM v0.34.0 Triton verify before collection:
-
-    export FLAGGEMS_METAX_KDA_VLLM034_BASELINE=1
-    python -m pytest -q tests/test_kda_recoverssm_verify.py
-    python -m pytest -q -s benchmark/test_kda_recoverssm_verify.py --level core
-
-With this setting, SpeedUp is the local v0.34.0 latency divided by the
-FlagGems latency on the same device.
+Accuracy and benchmark tests select the bundled vLLM v0.34.0 Triton verify
+on MetaX. The standalone native collector uses its installed vLLM.
 """
 
 import math
-import os
 from typing import NamedTuple, Optional
 
 import torch
-
-
-def _use_metax_v034_baseline():
-    if os.getenv("FLAGGEMS_METAX_KDA_VLLM034_BASELINE") != "1":
-        return False
-    from flaggems_vllm import vendor_name
-
-    return vendor_name == "metax"
-
-
-_USE_METAX_V034_BASELINE = _use_metax_v034_baseline()
-if _USE_METAX_V034_BASELINE:
-    from baseline.metax.kda_recoverssm_verify_v034 import (
-        NULL_BLOCK_ID,
-        KDARecoverSSMRecords,
-        kda_recoverssm_verify as _native,
-    )
-else:
-    from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
-        KDARecoverSSMRecords,
-        kda_recoverssm_verify as _native,
-    )
-    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 OP_NAME = "kda_recoverssm_verify"
 DTYPES = [torch.float16, torch.bfloat16]
@@ -48,8 +18,16 @@ MUTATED_INPUTS = ("out", "records")
 INPUT_SEED = 20261118
 
 
-def native():
-    return _native
+def _reference(vendor):
+    if vendor == "metax":
+        from baseline.metax import kda_recoverssm_verify_v034 as ref
+    else:
+        from vllm.models.kimi_k3.nvidia.ops import recoverssm as ref
+    return ref
+
+
+def native(vendor=None):
+    return _reference(vendor).kda_recoverssm_verify
 
 
 class Case(NamedTuple):
@@ -101,14 +79,15 @@ def key_shape(binding):
     )
 
 
-def build(case, dtype, device, state_dtype=torch.float32):
+def build(case, dtype, device, state_dtype=torch.float32, *, vendor=None):
+    ref = _reference(vendor)
     case = Case(*case)
     gen = torch.Generator().manual_seed(INPUT_SEED)
     n, total = len(case.lengths), sum(case.lengths)
     h, d = case.heads, case.head_dim
 
     def rand(shape, dt=dtype, scale=0.2):
-        if _USE_METAX_V034_BASELINE:
+        if vendor == "metax":
             # Form [1,T,H,D] after transfer so the head/dim strides are (D,1).
             flat = torch.randn(math.prod(shape), generator=gen)
             return (flat * scale).to(dt).to(device).view(shape)
@@ -123,7 +102,7 @@ def build(case, dtype, device, state_dtype=torch.float32):
     dt_bias = rand((h * d,), torch.float32)
     num_blocks = n + 4
     checkpoint_state = rand((num_blocks, h, d, d), state_dtype)
-    records = KDARecoverSSMRecords.allocate(
+    records = ref.KDARecoverSSMRecords.allocate(
         n, h, case.window, d, dtype, torch.device(device)
     )
     query_start_loc = torch.tensor(
@@ -131,9 +110,10 @@ def build(case, dtype, device, state_dtype=torch.float32):
         dtype=torch.int32,
         device=device,
     )
-    free = iter(range(NULL_BLOCK_ID + 1, num_blocks))
+    null_id = ref.NULL_BLOCK_ID
+    free = iter(range(null_id + 1, num_blocks))
     state_indices = torch.tensor(
-        [NULL_BLOCK_ID if b in case.null_requests else next(free) for b in range(n)],
+        [null_id if b in case.null_requests else next(free) for b in range(n)],
         dtype=torch.int32,
         device=device,
     )
