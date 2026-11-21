@@ -3,7 +3,7 @@
 """Native vLLM KDA RecoverSSM speculative-verify workloads and signatures.
 
 Accuracy and benchmark tests select the bundled vLLM v0.34.0 Triton verify
-on MetaX. The standalone native collector uses its installed vLLM.
+on MetaX and Moore Threads. The standalone native collector uses its installed vLLM.
 """
 
 import math
@@ -16,10 +16,11 @@ DTYPES = [torch.float16, torch.bfloat16]
 IS_INPLACE = False
 MUTATED_INPUTS = ("out", "records")
 INPUT_SEED = 20261118
+_V034_VENDORS = {"metax", "mthreads"}
 
 
 def _reference(vendor):
-    if vendor == "metax":
+    if vendor in _V034_VENDORS:
         from baseline.metax import kda_recoverssm_verify_v034 as ref
     else:
         from vllm.models.kimi_k3.nvidia.ops import recoverssm as ref
@@ -87,7 +88,7 @@ def build(case, dtype, device, state_dtype=torch.float32, *, vendor=None):
     h, d = case.heads, case.head_dim
 
     def rand(shape, dt=dtype, scale=0.2):
-        if vendor == "metax":
+        if vendor in _V034_VENDORS:
             # Form [1,T,H,D] after transfer so the head/dim strides are (D,1).
             flat = torch.randn(math.prod(shape), generator=gen)
             return (flat * scale).to(dt).to(device).view(shape)

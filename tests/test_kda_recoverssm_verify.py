@@ -18,9 +18,10 @@ import torch.nn.functional as F
 import flaggems_vllm as gems
 from baseline import kda_recoverssm_verify as baseline
 from baseline.kda_recoverssm_verify import PERF_CASES, Case
+from flaggems_vllm.runtime import torch_device_fn
 
 pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.skipif(not torch_device_fn.is_available(), reason="Accelerator required"),
     pytest.mark.kda_recoverssm_verify,
 ]
 
@@ -45,6 +46,12 @@ def reference(case, inputs):
     requests) are not stored by the kernel and must not be compared.
     """
     case = Case(*case)
+    if gems.vendor_name == "mthreads":
+        # MUSA lacks FP64. Run the independent oracle on the host.
+        inputs = {
+            key: value.cpu() if isinstance(value, torch.Tensor) else value
+            for key, value in inputs.items()
+        }
     q, k, v = inputs["q"], inputs["k"], inputs["v"]
     raw_g, raw_beta = inputs["raw_g"], inputs["raw_beta"]
     batch, heads, dim = len(case.lengths), case.heads, case.head_dim
@@ -90,11 +97,12 @@ def reference(case, inputs):
 def assert_records_match(case, inputs, records, ref_corr, written):
     case = Case(*case)
     d = case.head_dim
+    correction = records.correction.to(ref_corr.device)
     for b in range(len(case.lengths)):
         for off in range(case.lengths[b]):
             if not written[b, off]:
                 continue
-            rec = records.correction[b, :, off].to(torch.float64)
+            rec = correction[b, :, off].to(torch.float64)
             err = (rec - ref_corr[b, :, off]).abs().max().item()
             assert err <= CORRECTION_TOL, f"correction err {err:.3e} at ({b}, {off})"
             t = int(inputs["query_start_loc"][b]) + off
@@ -105,16 +113,16 @@ def assert_records_match(case, inputs, records, ref_corr, written):
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c.name for c in PERF_CASES])
 @pytest.mark.parametrize("dtype,state_dtype", PRECISIONS)
 def test_native_against_torch_oracle(case, dtype, state_dtype):
-    inputs = build(case, dtype, "cuda", state_dtype)
+    inputs = build(case, dtype, gems.device, state_dtype)
     checkpoint_before = inputs["checkpoint_state"].clone()
 
     out = NATIVE(**inputs)
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     ref_out, ref_corr, written = reference(case, inputs)
     case = Case(*case)
 
-    err = (out.to(torch.float64) - ref_out).abs().max().item()
+    err = (out.to(ref_out.device) - ref_out).abs().max().item()
     assert err <= OUT_TOL[dtype], f"out max abs err {err:.3e}"
     for b in case.null_requests:
         bos = int(inputs["query_start_loc"][b])
@@ -127,13 +135,13 @@ def test_native_against_torch_oracle(case, dtype, state_dtype):
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c.name for c in PERF_CASES])
 @pytest.mark.parametrize("dtype,state_dtype", PRECISIONS)
 def test_gems_matches_native(case, dtype, state_dtype):
-    native_inputs = build(case, dtype, "cuda", state_dtype)
-    gems_inputs = build(case, dtype, "cuda", state_dtype)
+    native_inputs = build(case, dtype, gems.device, state_dtype)
+    gems_inputs = build(case, dtype, gems.device, state_dtype)
     checkpoint_before = gems_inputs["checkpoint_state"].clone()
 
     native_out = NATIVE(**native_inputs)
     gems_out = gems.kda_recoverssm_verify(**gems_inputs)
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
 
     # Every out row is a valid token of some request, so out is fully
     # written; only reduction-order ULPs may differ between configs.
@@ -157,17 +165,17 @@ def test_gems_matches_native(case, dtype, state_dtype):
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_out_argument_and_duck_typed_records(dtype):
     case = Case("k3_tp8_mtp1_bs32", [2] * 32, window=2, heads=12)
-    inputs = build(case, dtype, "cuda")
+    inputs = build(case, dtype, gems.device)
     inputs["records"] = types.SimpleNamespace(
         correction=torch.empty_like(inputs["records"].correction),
         key_gate=torch.empty_like(inputs["records"].key_gate),
     )
     out = torch.empty_like(inputs["v"])
     returned = gems.kda_recoverssm_verify(**inputs, out=out)
-    torch.cuda.synchronize()
+    torch_device_fn.synchronize()
     assert returned.data_ptr() == out.data_ptr()
     ref_out, ref_corr, written = reference(case, inputs)
-    err = (out.to(torch.float64) - ref_out).abs().max().item()
+    err = (out.to(ref_out.device) - ref_out).abs().max().item()
     assert err <= OUT_TOL[dtype], f"out max abs err {err:.3e}"
     assert_records_match(case, inputs, inputs["records"], ref_corr, written)
 
@@ -175,7 +183,7 @@ def test_out_argument_and_duck_typed_records(dtype):
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_empty_tokens_early_return(dtype):
     case = Case("k3_tp8_mtp1_bs32", [2] * 32, window=2, heads=12)
-    inputs = build(case, dtype, "cuda")
+    inputs = build(case, dtype, gems.device)
     for name in ("q", "k", "v", "raw_g"):
         inputs[name] = inputs[name][:, :0]
     inputs["raw_beta"] = inputs["raw_beta"][:, :0]
@@ -203,7 +211,7 @@ CONTRACT_ERRORS = [
             q=torch.empty(
                 (1, i["q"].shape[1], i["q"].shape[2], i["q"].shape[3] * 2),
                 dtype=i["q"].dtype,
-                device="cuda",
+                device=i["q"].device,
             )[..., : i["q"].shape[3]].copy_(i["q"])
         ),
         "heads must be contiguous",
@@ -225,7 +233,7 @@ CONTRACT_ERRORS = [
         "query metadata is incompatible",
     ),
     (
-        lambda i: i.update(out=torch.empty(1, 1, 1, 1, dtype=i["v"].dtype, device="cuda")),
+        lambda i: i.update(out=i["v"].new_empty((1, 1, 1, 1))),
         "output shape is incompatible",
     ),
 ]
@@ -234,7 +242,7 @@ CONTRACT_ERRORS = [
 @pytest.mark.parametrize("mutate, message", CONTRACT_ERRORS)
 def test_contract_errors(mutate, message):
     case = Case("contract", [2] * 4, window=2, heads=4)
-    inputs = build(case, torch.bfloat16, "cuda")
+    inputs = build(case, torch.bfloat16, gems.device)
     mutate(inputs)
     with pytest.raises(ValueError, match=message):
         gems.kda_recoverssm_verify(**inputs)
@@ -242,7 +250,7 @@ def test_contract_errors(mutate, message):
 
 def test_device_mismatch_rejected():
     case = Case("contract", [2] * 4, window=2, heads=4)
-    inputs = build(case, torch.bfloat16, "cuda")
+    inputs = build(case, torch.bfloat16, gems.device)
     inputs["state_indices"] = inputs["state_indices"].cpu()
     with pytest.raises(ValueError, match="same device"):
         gems.kda_recoverssm_verify(**inputs)
