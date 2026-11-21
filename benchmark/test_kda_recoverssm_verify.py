@@ -45,7 +45,7 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
         out = op(**kwargs)
         torch_device_fn.synchronize()
         torch.testing.assert_close(
-            out.to(torch.float64),
+            out.to(expected.device).to(expected.dtype),
             expected,
             rtol=OUT_TOL[self.dtype],
             atol=OUT_TOL[self.dtype],
