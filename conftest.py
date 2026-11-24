@@ -1,18 +1,43 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared GEMM reduce-scatter fixtures for tests/ and benchmark/."""
+"""Shared pytest startup and GEMM reduce-scatter fixtures."""
 
 import atexit
 import importlib
 import os
 import sys
 import traceback
+from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
 
 _TLE_BOOTSTRAP = None
+
+
+def pytest_addoption(pluginmanager):
+    # This root hook runs before either child conftest imports flaggems_vllm.
+    # On MACA, loading the native KDA module afterwards aborts in mcoplib
+    # when it registers the _C::silu_and_mul schema a second time.
+    if find_spec("vllm_metax") is None:
+        return
+    config = pluginmanager.get_plugin("pytestconfig")
+    cwd = config.invocation_params.dir
+    paths = [
+        (cwd / arg.split("::", 1)[0]).resolve()
+        for arg in config.known_args_namespace.file_or_dir
+    ]
+    targets = [path for path in paths if path.exists()] or [cwd]
+    root = Path(__file__).resolve().parent
+    for folder in ("tests", "benchmark"):
+        kda = root / folder / "test_kda_recoverssm_verify.py"
+        if any(path == kda or path in kda.parents for path in targets):
+            import torch
+
+            if "metax" in torch.__version__.lower():
+                importlib.import_module("vllm.models.kimi_k3.nvidia.ops.recoverssm")
+            return
 
 
 def _cleanup_tle():
