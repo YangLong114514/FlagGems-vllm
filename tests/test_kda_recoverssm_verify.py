@@ -19,6 +19,7 @@ import flaggems_vllm as gems
 from baseline import kda_recoverssm_verify as baseline
 from baseline.kda_recoverssm_verify import PERF_CASES, Case
 from flaggems_vllm.runtime import torch_device_fn
+from tests.kda_recoverssm_worker import kda_worker  # noqa: F401
 
 pytestmark = [
     pytest.mark.skipif(
@@ -27,7 +28,6 @@ pytestmark = [
     pytest.mark.kda_recoverssm_verify,
 ]
 
-NATIVE = baseline.native()
 build = partial(baseline.build, vendor=gems.vendor_name)
 DTYPES = [torch.float16, torch.bfloat16]
 PRECISIONS = [
@@ -127,11 +127,21 @@ def assert_records_match(case, inputs, records, ref_corr, written):
 
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c.name for c in PERF_CASES])
 @pytest.mark.parametrize("dtype,state_dtype", PRECISIONS)
-def test_native_against_torch_oracle(case, dtype, state_dtype):
+def test_native_against_torch_oracle(
+    case, dtype, state_dtype, kda_worker
+):  # noqa: F811
+    if kda_worker is not None:
+        return kda_worker.submit(
+            _native_against_torch_oracle, case, dtype, state_dtype
+        ).result()
+    _native_against_torch_oracle(case, dtype, state_dtype)
+
+
+def _native_against_torch_oracle(case, dtype, state_dtype):
     inputs = build(case, dtype, gems.device, state_dtype, for_native=True)
     checkpoint_before = inputs["checkpoint_state"].clone()
 
-    out = NATIVE(**inputs)
+    out = baseline.native()(**inputs)
     torch_device_fn.synchronize()
 
     ref_out, ref_corr, written = reference(case, inputs)
@@ -149,12 +159,20 @@ def test_native_against_torch_oracle(case, dtype, state_dtype):
 
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c.name for c in PERF_CASES])
 @pytest.mark.parametrize("dtype,state_dtype", PRECISIONS)
-def test_gems_matches_native(case, dtype, state_dtype):
+def test_gems_matches_native(case, dtype, state_dtype, kda_worker):  # noqa: F811
+    if kda_worker is not None:
+        return kda_worker.submit(
+            _gems_matches_native, case, dtype, state_dtype
+        ).result()
+    _gems_matches_native(case, dtype, state_dtype)
+
+
+def _gems_matches_native(case, dtype, state_dtype):
     gems_inputs = build(case, dtype, gems.device, state_dtype)
     native_inputs = baseline.native_inputs(gems_inputs)
     checkpoint_before = gems_inputs["checkpoint_state"].clone()
 
-    native_out = NATIVE(**native_inputs)
+    native_out = baseline.native()(**native_inputs)
     gems_out = gems.kda_recoverssm_verify(**gems_inputs)
     torch_device_fn.synchronize()
 
