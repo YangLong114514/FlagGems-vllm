@@ -2,8 +2,10 @@
 # Copyright 2026 FlagOS Contributors
 """Native vLLM KDA RecoverSSM speculative-verify workloads and signatures.
 
-Use the installed native verify entry point and its records ABI. vLLM 0.29
-and 0.32 use checkpoint blocks, while 0.34 uses speculative batch rows.
+The accuracy tests and benchmarks support the upstream vLLM v0.33.0 and
+v0.34.0 Triton verify interface. Both write ``records`` by speculative batch
+row. In v0.29.0 and v0.32.0, verify writes ``correction_cache`` and ``kg_cache``
+by physical checkpoint block. The installed function signature selects the layout.
 """
 
 import inspect
@@ -17,7 +19,7 @@ OP_NAME = "kda_recoverssm_verify"
 DTYPES = [torch.float16, torch.bfloat16]
 IS_INPLACE = False
 INPUT_SEED = 20261118
-NULL_BLOCK_ID = 0  # vLLM KDA checkpoint sentinel in v0.29, v0.32 and v0.34.
+NULL_BLOCK_ID = 0  # vLLM's reserved block for requests without a checkpoint.
 
 
 def native():
