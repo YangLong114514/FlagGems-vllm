@@ -12,6 +12,7 @@ from flaggems_vllm.runtime import torch_device_fn
 from tests.test_kda_recoverssm_verify import (
     OUT_TOL,
     assert_records_match,
+    records_by_request,
     reference,
 )
 
@@ -42,6 +43,9 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
         if self.reference_data is None:
             self.reference_data = reference(self.case, kwargs)
         expected, ref_corr, written = self.reference_data
+        if op is self.torch_op:
+            kwargs = baseline.native_inputs(kwargs)
+        kwargs["out"] = torch.empty_like(kwargs["v"])
         out = op(**kwargs)
         torch_device_fn.synchronize()
         torch.testing.assert_close(
@@ -50,7 +54,9 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
             rtol=OUT_TOL[self.dtype],
             atol=OUT_TOL[self.dtype],
         )
-        assert_records_match(self.case, kwargs, kwargs["records"], ref_corr, written)
+        assert_records_match(
+            self.case, kwargs, records_by_request(kwargs), ref_corr, written
+        )
         return super().get_latency(op, *args, **kwargs)
 
 
@@ -58,7 +64,7 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
 def test_kda_recoverssm_verify():
     KDARecoverSSMVerifyBenchmark(
         op_name=baseline.OP_NAME,
-        torch_op=baseline.native(gems.vendor_name),
+        torch_op=baseline.native(),
         gems_op=gems.kda_recoverssm_verify,
         is_inplace=baseline.IS_INPLACE,
     ).run()

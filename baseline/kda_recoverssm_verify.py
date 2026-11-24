@@ -2,11 +2,13 @@
 # Copyright 2026 FlagOS Contributors
 """Native vLLM KDA RecoverSSM speculative-verify workloads and signatures.
 
-Accuracy and benchmark tests select the bundled vLLM v0.34.0 Triton verify
-on MetaX and Moore Threads. The standalone native collector uses its installed vLLM.
+Use the installed native verify entry point and its records ABI. vLLM 0.29
+and 0.32 use checkpoint blocks, while 0.34 uses speculative batch rows.
 """
 
+import inspect
 import math
+from types import SimpleNamespace
 from typing import NamedTuple, Optional
 
 import torch
@@ -14,21 +16,58 @@ import torch
 OP_NAME = "kda_recoverssm_verify"
 DTYPES = [torch.float16, torch.bfloat16]
 IS_INPLACE = False
-MUTATED_INPUTS = ("out", "records")
 INPUT_SEED = 20261118
-_V034_VENDORS = {"metax", "mthreads"}
 
 
-def _reference(vendor):
-    if vendor in _V034_VENDORS:
-        from baseline.metax import kda_recoverssm_verify_v034 as ref
+def native():
+    from vllm.models.kimi_k3.nvidia.ops.recoverssm import kda_recoverssm_verify
+
+    return kda_recoverssm_verify
+
+
+def _uses_block_cache():
+    params = inspect.signature(native()).parameters
+    if "records" in params:
+        return False
+    if {"correction_cache", "kg_cache"} <= params.keys():
+        return True
+    raise ValueError(f"Unsupported native KDA verify signature: {list(params)}")
+
+
+def _record_kwargs(inputs, *, for_native):
+    k, v = inputs["k"], inputs["v"]
+    heads, key_dim = k.shape[2:]
+    batch = inputs["state_indices"].numel()
+    window = inputs["spec_query_len"]
+    if for_native and _uses_block_cache():
+        rows = inputs["checkpoint_state"].shape[0]
+        shape = (rows, heads, window)
+        return dict(
+            correction_cache=v.new_empty((*shape, v.shape[-1]), dtype=torch.float32),
+            kg_cache=k.new_empty((*shape, 2 * key_dim)),
+        )
+    if for_native:
+        from vllm.models.kimi_k3.nvidia.ops.recoverssm import KDARecoverSSMRecords
+
+        records = KDARecoverSSMRecords.allocate(
+            batch, heads, window, key_dim, k.dtype, k.device
+        )
     else:
-        from vllm.models.kimi_k3.nvidia.ops import recoverssm as ref
-    return ref
+        shape = (batch, heads, window)
+        records = SimpleNamespace(
+            correction=v.new_empty((*shape, v.shape[-1]), dtype=torch.float32),
+            key_gate=k.new_empty((*shape, 2 * key_dim)),
+        )
+    return dict(records=records)
 
 
-def native(vendor=None):
-    return _reference(vendor).kda_recoverssm_verify
+def native_inputs(inputs):
+    """Share read-only workload tensors and allocate independent native records."""
+    kwargs = inputs.copy()
+    kwargs.pop("records")
+    kwargs.pop("out", None)
+    kwargs.update(_record_kwargs(kwargs, for_native=True))
+    return kwargs
 
 
 class Case(NamedTuple):
@@ -80,15 +119,18 @@ def key_shape(binding):
     )
 
 
-def build(case, dtype, device, state_dtype=torch.float32, *, vendor=None):
-    ref = _reference(vendor)
+def build(
+    case, dtype, device, state_dtype=torch.float32, *, vendor=None, for_native=False
+):
+    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
     case = Case(*case)
     gen = torch.Generator().manual_seed(INPUT_SEED)
     n, total = len(case.lengths), sum(case.lengths)
     h, d = case.heads, case.head_dim
 
     def rand(shape, dt=dtype, scale=0.2):
-        if vendor in _V034_VENDORS:
+        if vendor in ("metax", "mthreads"):
             # Form [1,T,H,D] after transfer so the head/dim strides are (D,1).
             flat = torch.randn(math.prod(shape), generator=gen)
             return (flat * scale).to(dt).to(device).view(shape)
@@ -103,22 +145,20 @@ def build(case, dtype, device, state_dtype=torch.float32, *, vendor=None):
     dt_bias = rand((h * d,), torch.float32)
     num_blocks = n + 4
     checkpoint_state = rand((num_blocks, h, d, d), state_dtype)
-    records = ref.KDARecoverSSMRecords.allocate(
-        n, h, case.window, d, dtype, torch.device(device)
-    )
     query_start_loc = torch.tensor(
         [0] + list(torch.tensor(case.lengths).cumsum(0).tolist()),
         dtype=torch.int32,
         device=device,
     )
-    null_id = ref.NULL_BLOCK_ID
-    free = iter(range(null_id + 1, num_blocks))
+    blocks = range(NULL_BLOCK_ID + 1, num_blocks)
+    # Cover non-sequential physical slots in the NULL-checkpoint edge case.
+    free = reversed(blocks) if case.null_requests else iter(blocks)
     state_indices = torch.tensor(
-        [null_id if b in case.null_requests else next(free) for b in range(n)],
+        [NULL_BLOCK_ID if b in case.null_requests else next(free) for b in range(n)],
         dtype=torch.int32,
         device=device,
     )
-    return dict(
+    inputs = dict(
         q=q,
         k=k,
         v=v,
@@ -128,15 +168,16 @@ def build(case, dtype, device, state_dtype=torch.float32, *, vendor=None):
         dt_bias=dt_bias,
         lower_bound=case.lower_bound,
         checkpoint_state=checkpoint_state,
-        records=records,
         query_start_loc=query_start_loc,
         state_indices=state_indices,
         spec_query_len=case.window,
     )
+    inputs.update(_record_kwargs(inputs, for_native=for_native))
+    return inputs
 
 
 def build_inputs(binding, dtype, device):
-    return (), build(Case(*binding["case"]), dtype, device)
+    return (), build(Case(*binding["case"]), dtype, device, for_native=True)
 
 
 def unsupported_reason(binding, dtype):
@@ -166,25 +207,30 @@ def config(binding, dtype, state_dtype=torch.float32):
         "dt_bias": tensor([h * d], torch.float32),
         "lower_bound": {"scalar": case.lower_bound},
         "checkpoint_state": tensor([num_blocks, h, d, d], state_dtype),
-        "records": {
-            "correction": tensor([n, h, w, d], torch.float32),
-            "key_gate": tensor([n, h, w, 2 * d], dtype),
-        },
         "query_start_loc": tensor([n + 1], torch.int32),
         "state_indices": tensor([n], torch.int32),
         "spec_query_len": {"scalar": w},
     }
+    outputs = {"out": tensor([1, total, h, d], dtype)}
+    if _uses_block_cache():
+        inputs["correction_cache"] = tensor([num_blocks, h, w, d], torch.float32)
+        inputs["kg_cache"] = tensor([num_blocks, h, w, 2 * d], dtype)
+        outputs.update({key: inputs[key] for key in ("correction_cache", "kg_cache")})
+    else:
+        inputs["records"] = {
+            "correction": tensor([n, h, w, d], torch.float32),
+            "key_gate": tensor([n, h, w, 2 * d], dtype),
+        }
+        outputs.update(
+            {f"records.{key}": val for key, val in inputs["records"].items()}
+        )
     return dict(
         inputs=inputs,
-        outputs={
-            "out": tensor([1, total, h, d], dtype),
-            "records.correction": tensor([n, h, w, d], torch.float32),
-            "records.key_gate": tensor([n, h, w, 2 * d], dtype),
-        },
+        outputs=outputs,
         dims=case._asdict(),
         accumulate_dtype="torch.float32",
         input_seed=INPUT_SEED,
-        mutation=["out", "records (verify records rewritten every call)"],
+        mutation=list(outputs),
         native_unsupported_reason=unsupported_reason(binding, dtype),
         graph=False,
     )

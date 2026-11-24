@@ -21,11 +21,13 @@ from baseline.kda_recoverssm_verify import PERF_CASES, Case
 from flaggems_vllm.runtime import torch_device_fn
 
 pytestmark = [
-    pytest.mark.skipif(not torch_device_fn.is_available(), reason="Accelerator required"),
+    pytest.mark.skipif(
+        not torch_device_fn.is_available(), reason="Accelerator required"
+    ),
     pytest.mark.kda_recoverssm_verify,
 ]
 
-NATIVE = baseline.native(gems.vendor_name)
+NATIVE = baseline.native()
 build = partial(baseline.build, vendor=gems.vendor_name)
 DTYPES = [torch.float16, torch.bfloat16]
 PRECISIONS = [
@@ -51,6 +53,7 @@ def reference(case, inputs):
         inputs = {
             key: value.cpu() if isinstance(value, torch.Tensor) else value
             for key, value in inputs.items()
+            if key not in ("out", "records", "correction_cache", "kg_cache")
         }
     q, k, v = inputs["q"], inputs["k"], inputs["v"]
     raw_g, raw_beta = inputs["raw_g"], inputs["raw_beta"]
@@ -94,6 +97,18 @@ def reference(case, inputs):
     return out, corr_all, written
 
 
+def records_by_request(inputs):
+    if "records" in inputs:
+        return inputs["records"]
+    # v0.29/v0.32 write at the physical checkpoint slot. Only valid rows
+    # and token positions are inspected by the assertions below.
+    rows = inputs["state_indices"].clamp_min(0).long()
+    return types.SimpleNamespace(
+        correction=inputs["correction_cache"].index_select(0, rows),
+        key_gate=inputs["kg_cache"].index_select(0, rows),
+    )
+
+
 def assert_records_match(case, inputs, records, ref_corr, written):
     case = Case(*case)
     d = case.head_dim
@@ -113,7 +128,7 @@ def assert_records_match(case, inputs, records, ref_corr, written):
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c.name for c in PERF_CASES])
 @pytest.mark.parametrize("dtype,state_dtype", PRECISIONS)
 def test_native_against_torch_oracle(case, dtype, state_dtype):
-    inputs = build(case, dtype, gems.device, state_dtype)
+    inputs = build(case, dtype, gems.device, state_dtype, for_native=True)
     checkpoint_before = inputs["checkpoint_state"].clone()
 
     out = NATIVE(**inputs)
@@ -129,14 +144,14 @@ def test_native_against_torch_oracle(case, dtype, state_dtype):
         eos = int(inputs["query_start_loc"][b + 1])
         assert out[0, bos:eos].abs().max().item() == 0.0
     assert torch.equal(inputs["checkpoint_state"], checkpoint_before)
-    assert_records_match(case, inputs, inputs["records"], ref_corr, written)
+    assert_records_match(case, inputs, records_by_request(inputs), ref_corr, written)
 
 
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c.name for c in PERF_CASES])
 @pytest.mark.parametrize("dtype,state_dtype", PRECISIONS)
 def test_gems_matches_native(case, dtype, state_dtype):
-    native_inputs = build(case, dtype, gems.device, state_dtype)
     gems_inputs = build(case, dtype, gems.device, state_dtype)
+    native_inputs = baseline.native_inputs(gems_inputs)
     checkpoint_before = gems_inputs["checkpoint_state"].clone()
 
     native_out = NATIVE(**native_inputs)
@@ -150,13 +165,14 @@ def test_gems_matches_native(case, dtype, state_dtype):
     # Record slots beyond a request's token count (and rows of NULL
     # requests) are never written by either kernel; compare written slots.
     case = Case(*case)
+    native_records = records_by_request(native_inputs)
     for b, length in enumerate(case.lengths):
         if b in case.null_requests:
             continue
-        native_corr = native_inputs["records"].correction[b, :, :length]
+        native_corr = native_records.correction[b, :, :length]
         gems_corr = gems_inputs["records"].correction[b, :, :length]
         torch.testing.assert_close(gems_corr, native_corr, rtol=1e-4, atol=1e-5)
-        native_kg = native_inputs["records"].key_gate[b, :, :length]
+        native_kg = native_records.key_gate[b, :, :length]
         gems_kg = gems_inputs["records"].key_gate[b, :, :length]
         assert torch.equal(gems_kg, native_kg)
     assert torch.equal(gems_inputs["checkpoint_state"], checkpoint_before)
