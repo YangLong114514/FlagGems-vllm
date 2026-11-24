@@ -17,6 +17,7 @@ OP_NAME = "kda_recoverssm_verify"
 DTYPES = [torch.float16, torch.bfloat16]
 IS_INPLACE = False
 INPUT_SEED = 20261118
+NULL_BLOCK_ID = 0  # vLLM KDA checkpoint sentinel in v0.29, v0.32 and v0.34.
 
 
 def native():
@@ -122,8 +123,6 @@ def key_shape(binding):
 def build(
     case, dtype, device, state_dtype=torch.float32, *, vendor=None, for_native=False
 ):
-    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-
     case = Case(*case)
     gen = torch.Generator().manual_seed(INPUT_SEED)
     n, total = len(case.lengths), sum(case.lengths)

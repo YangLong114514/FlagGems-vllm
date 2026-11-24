@@ -7,8 +7,11 @@ import torch
 
 import flaggems_vllm as gems
 from baseline import kda_recoverssm_verify as baseline
+from benchmark import base
+from benchmark import conftest as bench_config
 from benchmark.base import Benchmark
 from flaggems_vllm.runtime import torch_device_fn
+from tests.kda_recoverssm_worker import kda_worker  # noqa: F401
 from tests.test_kda_recoverssm_verify import (
     OUT_TOL,
     assert_records_match,
@@ -60,11 +63,38 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
         return super().get_latency(op, *args, **kwargs)
 
 
-@pytest.mark.kda_recoverssm_verify
-def test_kda_recoverssm_verify():
+def _run_benchmark():
     KDARecoverSSMVerifyBenchmark(
         op_name=baseline.OP_NAME,
         torch_op=baseline.native(),
         gems_op=gems.kda_recoverssm_verify,
         is_inplace=baseline.IS_INPLACE,
     ).run()
+
+
+def _run_metax_benchmark(config):
+    # The child has no pytest session. Keep the usual Benchmark.run protocol
+    # and forward its report entries to the parent session for recording.
+    results, messages = [], []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(base, "Config", config)
+        patch.setattr(
+            base, "update_result", lambda name, data: results.append((name, data))
+        )
+        patch.setattr(base, "emit_record_logger", messages.append)
+        _run_benchmark()
+    return results, messages
+
+
+@pytest.mark.kda_recoverssm_verify
+def test_kda_recoverssm_verify(kda_worker):  # noqa: F811
+    if kda_worker is None:
+        _run_benchmark()
+        return
+    results, messages = kda_worker.submit(
+        _run_metax_benchmark, bench_config.Config
+    ).result()
+    for name, data in results:
+        bench_config.update_result(name, data)
+    for message in messages:
+        bench_config.emit_record_logger(message)
