@@ -10,8 +10,11 @@ by physical checkpoint block. The installed function signature selects the layou
 
 import inspect
 import math
+from contextlib import nullcontext
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import NamedTuple, Optional
+from unittest.mock import patch
 
 import torch
 
@@ -22,8 +25,27 @@ INPUT_SEED = 20261118
 NULL_BLOCK_ID = 0  # vLLM's reserved block for requests without a checkpoint.
 
 
+@lru_cache(maxsize=1)
 def native():
-    from vllm.models.kimi_k3.nvidia.ops.recoverssm import kda_recoverssm_verify
+    from vllm.platforms import current_platform
+
+    capability_probe = nullcontext()
+    if hasattr(type(current_platform), "is_ppu") and current_platform.is_ppu():
+        from vllm.platforms.cuda import NonNvmlCudaPlatform, pynvml
+
+        # Importing kimi_k3 probes CUTLASS via PPUPlatform's inherited NVML
+        # method. SAIL PyTorch can query the same device without that library.
+        try:
+            current_platform.get_device_capability()
+        except pynvml.NVMLError_LibraryNotFound:
+            capability_probe = patch.object(
+                type(current_platform),
+                "get_device_capability",
+                NonNvmlCudaPlatform.get_device_capability,
+            )
+
+    with capability_probe:
+        from vllm.models.kimi_k3.nvidia.ops.recoverssm import kda_recoverssm_verify
 
     return kda_recoverssm_verify
 
