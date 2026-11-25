@@ -132,7 +132,8 @@ PERF_CASES = PRODUCTION_CASES + EDGE_CASES
 
 
 def grid():
-    return [{"case": case} for case in PERF_CASES]
+    # The collector embeds each binding as a Python literal in its NCU worker.
+    return [{"case": tuple(case)} for case in PERF_CASES]
 
 
 def key_shape(binding):
@@ -200,7 +201,9 @@ def build(
 
 
 def build_inputs(binding, dtype, device):
-    return (), build(Case(*binding["case"]), dtype, device, for_native=True)
+    inputs = build(binding["case"], dtype, device, for_native=True)
+    inputs["out"] = torch.empty_like(inputs["v"])
+    return (), inputs
 
 
 def unsupported_reason(binding, dtype):
@@ -234,7 +237,8 @@ def config(binding, dtype, state_dtype=torch.float32):
         "state_indices": tensor([n], torch.int32),
         "spec_query_len": {"scalar": w},
     }
-    outputs = {"out": tensor([1, total, h, d], dtype)}
+    inputs["out"] = tensor([1, total, h, d], dtype)
+    outputs = {"out": inputs["out"]}
     if _uses_block_cache():
         inputs["correction_cache"] = tensor([num_blocks, h, w, d], torch.float32)
         inputs["kg_cache"] = tensor([num_blocks, h, w, 2 * d], dtype)
