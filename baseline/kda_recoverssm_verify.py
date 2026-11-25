@@ -32,18 +32,17 @@ def native():
 
     capability_probe = nullcontext()
     if hasattr(type(current_platform), "is_ppu") and current_platform.is_ppu():
-        from vllm.platforms.cuda import NonNvmlCudaPlatform, pynvml
+        from vllm.platforms.interface import DeviceCapability
 
-        # Importing kimi_k3 probes CUTLASS via PPUPlatform's inherited NVML
-        # method. SAIL PyTorch can query the same device without that library.
-        try:
-            current_platform.get_device_capability()
-        except pynvml.NVMLError_LibraryNotFound:
-            capability_probe = patch.object(
-                type(current_platform),
-                "get_device_capability",
-                NonNvmlCudaPlatform.get_device_capability,
-            )
+        @classmethod
+        def get_device_capability(cls, device_id=0):
+            major, minor = torch.cuda.get_device_capability(device_id)
+            return DeviceCapability(major=major, minor=minor)
+
+        # Kimi K3 probes device capability while importing the model on PPU.
+        capability_probe = patch.object(
+            type(current_platform), "get_device_capability", get_device_capability
+        )
 
     with capability_probe:
         from vllm.models.kimi_k3.nvidia.ops.recoverssm import kda_recoverssm_verify
