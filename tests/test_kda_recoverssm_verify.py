@@ -100,8 +100,8 @@ def reference(case, inputs):
 def records_by_request(inputs):
     if "records" in inputs:
         return inputs["records"]
-    # v0.29/v0.32 write at the physical checkpoint slot. Only valid rows
-    # and token positions are inspected by the assertions below.
+    # Gather physical checkpoint slots in request order for comparison.
+    # The assertions below inspect only valid rows and token positions.
     rows = inputs["state_indices"].clamp_min(0).long()
     return types.SimpleNamespace(
         correction=inputs["correction_cache"].index_select(0, rows),
