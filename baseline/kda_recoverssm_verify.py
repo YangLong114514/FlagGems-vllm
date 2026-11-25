@@ -2,10 +2,11 @@
 # Copyright 2026 FlagOS Contributors
 """Native vLLM KDA RecoverSSM speculative-verify workloads and signatures.
 
-The accuracy tests and benchmarks support the upstream vLLM v0.33.0 and
-v0.34.0 Triton verify interface. Both write ``records`` by speculative batch
-row. In v0.29.0 and v0.32.0, verify writes ``correction_cache`` and ``kg_cache``
-by physical checkpoint block. The installed function signature selects the layout.
+Hygon vLLM 0.28.1+dtk2604 and MetaX 0.29 ship the same ``recoverssm.py``
+as upstream v0.28.1rc0 and v0.29.0. Their verify kernel and the Moore Threads
+0.32 verify kernel write ``correction_cache`` and ``kg_cache`` by physical
+checkpoint block. Upstream v0.33.0 and v0.34.0 write ``records`` by speculative
+batch row. Tests and benchmarks select the layout from the installed signature.
 """
 
 import inspect
