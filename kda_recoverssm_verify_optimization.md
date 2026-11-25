@@ -1,6 +1,6 @@
 # KDA RecoverSSM Verify 优化记录
 
-本文记录 `kda_recoverssm_verify` 在 Kimi K3 生产 Shape 上已经验证的优化方法、实际效果和失败尝试。性能数据均来自 NVIDIA H800，基线为 vLLM 0.34.0 的 Triton kernel，FlagGems 输入为 BF16 activation + FP32 checkpoint state。
+第 1–7 节记录 NVIDIA H800 上的历史实验，基线为 vLLM 0.34.0 Triton kernel，输入为 BF16 activation 和 FP32 checkpoint state。第 3 节的生产性能表最后更新于原分支 `feat/kda-recoverssm-verify` 的 `d6c8e1a`，对应当前分支 rebase 后的 `209e5c7`。第 8 节记录此后 `feat/metax-kda-recoverssm-verify-baseline` 截至 `d99f996` 的开发。两个提交之间的产品 verify kernel 源文件相同，后续改动集中在测试、基线和性能采集。
 
 ## 1. 算子特征与优化约束
 
@@ -123,7 +123,7 @@ Q2 分桶前的首次调优顺序实验：
 
 回退后曾用旧固定 5/25 口径验证：92 项功能测试通过；Graph 保持设备端收益，而 Q2/B32、Q4/B32 的 eager wrapper 重新低于 0.9。这确认启动试验的收益来自主机路径。当前 benchmark 已删除该自定义计时，统一使用仓库基类；通用 Kernel/Graph 结果见第 3 节，不能与旧 eager wrapper 数值直接比较。
 
-## 3. 当前生产 Shape 性能
+## 3. H800 生产 Shape 性能（`209e5c7`）
 
 SpeedUp 定义为 `vLLM latency / FlagGems latency`，数值越大越好。当前 benchmark 不再自定义统计口径：Kernel 由通用 `Benchmark.get_latency()` 调用 `triton.testing.do_bench`，使用 `Config.warm_up/Config.repetition` 并返回 median；CUDA Graph 由同一基类调用 `do_bench_cudagraph`。下表命令分别为 `--iter 1 --warmup 1` 和 `--iter 100 --warmup 1`，延迟单位为 ms。旧固定 5 warmup/25 device-event 的数据仅作历史记录，不与本表直接比较。
 
@@ -140,7 +140,7 @@ SpeedUp 定义为 `vLLM latency / FlagGems latency`，数值越大越好。当�
 | k3_tp1_mtp1_bs8 | 0.046464 | 0.039504 | 1.176 | 0.038134 | 0.031301 | 1.218 |
 | k3_tp1_spec3_bs16 | 0.137488 | 0.100288 | 1.371 | 0.129336 | 0.091429 | 1.415 |
 
-这张表是当前实现相对 vLLM 的最终结果，不能全部归因于某一项代码改动。Q8 外提、guarded token、精确 tile 和 workload 分桶的增量分别见第 2.1、2.2、2.3 和 2.5 节。
+这张表是该提交在 H800 上相对同机 vLLM 的实测结果。Q8 外提、guarded token、精确 tile 和 workload 分桶的增量分别见第 2.1、2.2、2.3 和 2.5 节。
 
 ## 4. NCU profile 与瓶颈评估
 
@@ -226,9 +226,9 @@ NCU SpeedUp 为 `native NCU duration / Gems NCU duration`。Occupancy 为 achiev
 
 这些试验均未修改生产代码。在不引入 fast-launch 的前提下，当前公共主机路径已接近本轮可安全兑现的收益上限；第 3 节性能表继续保持有效。
 
-## 7. 复现命令
+## 7. H800 原实验复现命令
 
-当前容器需要把 CUDA compat library 放在 `LD_LIBRARY_PATH` 前面。以下命令使用 GPU 4，并用内存 SQLite 避免持久化调优缓存影响结果。
+原 H800 实验容器需要把 CUDA compat library 放在 `LD_LIBRARY_PATH` 前面。以下命令使用 GPU 4，并用内存 SQLite 避免持久化调优缓存影响结果。
 
 ```bash
 export CUDA_VISIBLE_DEVICES=4
@@ -244,3 +244,38 @@ python -m pytest -q -s benchmark/test_kda_recoverssm_verify.py \
 ```
 
 NCU 2025.4.1 已在开发机的工作区本地解压使用，没有修改系统 CUDA 包。现有结论来自功能对拍、编译后的 register/spill 数据、固定配置对照、完整生产 benchmark 和第 4 节的 NCU full profile。
+
+## 8. 多平台精度和性能基线（2026-11-25）
+
+### 8.1 原生实现与缓存布局
+
+沐曦和摩尔曾在测试中使用仓库内复制的 vLLM 0.34.0 kernel（`df10933`、`6cb47ba`、`fa67218`）。`de9b4c9` 移除了这份副本。现在精度用例和 benchmark 都直接导入机器上安装的 `vllm.models.kimi_k3.nvidia.ops.recoverssm.kda_recoverssm_verify`，按函数签名构造输入。该入口用于独立测量 verify；模型推理时的分派需要另行确认。[基线实现](baseline/kda_recoverssm_verify.py)
+
+| 已核对的版本 | verify 写入位置及测试处理 |
+| --- | --- |
+| 沐曦 0.29、摩尔 0.32、海光 0.28.1+dtk2604 | native 接收 `correction_cache` 和 `kg_cache`，请求 `b` 写入物理块 `state_indices[b]`；断言前按请求顺序取回有效记录。海光文件与官方 v0.28.1rc0、v0.29.0 及沐曦样本逐字节一致。摩尔样本的差异在 commit 阶段的块边界计算，verify 相同（`afdf148`）。 |
+| 官方 v0.33.0、v0.34.0 | native 接收 `records`，请求 `b` 写入第 `b` 行，与 FlagGems 的接口一致。官方 0.33.0 兼容性记录于 `eb9a7fa`。 |
+
+精度测试分别对比 native 与 Torch 参考、FlagGems 与 native，检查输出、有效 token 的 correction 和 key/gate 记录，以及 checkpoint 保持原值。摩尔的 FP64 Torch 参考在 CPU 上计算。海光镜像的 Kimi K3 模型类解析到 AMD 路径，其 speculative 分支调用 `fused_recurrent_kda`；直接测试镜像自带 verify 的结果仅代表这条独立算子路径。[精度用例](tests/test_kda_recoverssm_verify.py)
+
+### 8.2 厂商导入与计时
+
+- **沐曦**（`154320a`）。精度和性能用例使用同一套进程隔离逻辑，在通过 `spawn` 启动的子进程中先导入 native，让 mcoplib 先注册，再加载 FlagGems 测试代码。导入顺序由 KDA 用例控制。[子进程初始化](tests/kda_recoverssm_worker.py)
+- **平头哥**（`3f61b93`、`d2b5dca`）。首次导入 Kimi K3 触发 CUTLASS 能力探测，SAIL 继承的 NVML 查询因缺少 `libnvidia-ml.so.1` 失败。最终实现仅在 PPU 导入 native 期间，用 `torch.cuda.get_device_capability(device_id)` 构造 vLLM 的 `DeviceCapability`，退出后恢复平台方法。已做模拟导入验证，仍待在原 PPU 容器的新进程里单跑首例确认。[导入实现](baseline/kda_recoverssm_verify.py)
+- **摩尔**。排查时 MUSA stream、Graph capture 和 replay 均通过，报错发生在该镜像的 Triton Graph timer 调用 `torch.cuda.current_stream()`。KDA benchmark 使用仓库通用计时；该分支没有算子专用的 MUSA timer。复核性能时应记录镜像版本及实际计时模式。[性能用例](benchmark/test_kda_recoverssm_verify.py)
+
+### 8.3 同机 SpeedUp 与跨芯片 vs Base
+
+`d99f996` 将采集用例编码为 NCU 子进程可重建的普通 Python 元组，并将 NV native 和目标平台的 `out` 都移到计时前分配。benchmark 通过同一个用例键和 dtype 精确匹配离线 JSON。NV 采集覆盖 10 个生产形状和 3 个边界用例，FP16/BF16 共 26 条；目标平台 benchmark 默认测 10 个 BF16 生产形状。[采集输入与形状键](baseline/kda_recoverssm_verify.py) · [benchmark](benchmark/test_kda_recoverssm_verify.py)
+
+```bash
+# 在 NV 参考机采集。默认参考卡为 H800。
+python tools/collect_baseline_nvidia.py --ops kda_recoverssm_verify --output tools/kda_nv.json
+
+# 将该 JSON 复制到目标机后，在同一份代码上运行。
+python -m pytest -q -s benchmark/test_kda_recoverssm_verify.py --base-data tools/kda_nv.json
+```
+
+`SpeedUp` 是目标机 native 延迟除以同机 FlagGems 延迟。`vs Base` 是 NV native 延迟除以目标机 FlagGems 延迟，再除以硬件系数。该系数按 NV 记录的瓶颈资源选择，为目标芯片与参考芯片对应带宽或计算能力的比值。检查日志中的 `factor=`；值为 `None` 时，显示的是未经折算的延迟比。[折算实现](benchmark/base.py) · [采集器](tools/collect_baseline_nvidia.py)
+
+截至 `d99f996`，两套 native 接口各 26 组已用 CPU 和 meta 张量验证 NCU 脚本的输入重建、输出预分配和 JSON 匹配。该适配尚待在 NV 参考机采集实际延迟与 NCU 瓶颈，再在目标机核对硬件系数和 `vs Base`。第 3 节的 H800 实测表保留原测量口径。
