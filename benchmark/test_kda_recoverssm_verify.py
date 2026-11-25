@@ -40,7 +40,11 @@ class KDARecoverSSMVerifyBenchmark(Benchmark):
             yield (inputs,)
 
     def record_shapes(self, *args, **kwargs):
-        return dict(case=self.case.name, inputs=super().record_shapes(*args, **kwargs))
+        return dict(
+            case=self.case.name,
+            baseline_shape_key=baseline.key_shape({"case": self.case}),
+            inputs=super().record_shapes(*args, **kwargs),
+        )
 
     def get_latency(self, op, *args, **kwargs):
         if self.reference_data is None:
