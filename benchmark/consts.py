@@ -428,20 +428,15 @@ def lookup_base_record_ex(base_data, op_name, dtype, shape_detail, variant=None)
     Never raises: an unmatched entry just yields a reason. Baseline layout
     (see tools/collect_baseline_nvidia.py):
         base_data[op_name]["shapes"][str([d0, d1, ...])][str(dtype)]
-    Benchmarks can supply their collector's exact key as ``baseline_shape_key``
-    in shape_detail. Otherwise match the first tensor shape or input signature.
+    The shape key is the string of the first tensor's dimensions, which matches
+    the collector's key_shape for ops like grouped_topk / fused_add_rms_norm.
+    Ops whose shape cannot be expressed this way simply won't match.
     """
     try:
         op_entry = _resolve_op_entry(base_data, op_name, variant)
         if not op_entry:
             return None, f"operator '{op_name}' not found in baseline"
         shapes = op_entry.get("shapes", {})
-        if isinstance(shape_detail, dict) and "baseline_shape_key" in shape_detail:
-            key = shape_detail["baseline_shape_key"]
-            rec = shapes.get(key, {}).get(str(dtype))
-            if rec is None:
-                return None, f"operator '{op_name}' has no baseline for {key} / {dtype}"
-            return rec, None
         first_shape = _first_tensor_shape(shape_detail)
         if first_shape is None:
             return None, (
