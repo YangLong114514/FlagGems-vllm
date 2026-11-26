@@ -2,13 +2,13 @@
 
 原始评估基于 `feat/kda-recoverssm-verify` 的 `d934b34`，建议文档首次提交于 `61f3200`。在当前分支的 rebase 历史中，两者分别对应 `f595715` 和 `6fd993a`。原评估引用 NVIDIA H800 相对 vLLM 0.34.0 Triton 实现的测量，输入为 BF16 activation、FP32 checkpoint，生产形状均为 `K=V=128`。Q2、Q4、Q8 分别表示每个请求最多验证 2、4、8 个 token。Ascend 独立后端及 persistent Vector 优化记录见[优化记录第 9 节](kda_recoverssm_verify_optimization.md#9-ascend-独立后端与-persistent-vector-优化2026-11-26)。[原始评估依据](https://github.com/YangLong114514/FlagGems-vllm/blob/d934b3461dbf76f00027e20ffaaf18e1cdd15695/kda_recoverssm_verify_optimization.md)
 
-## 建议落实情况（截至 `d99f996` 及本次 Ascend 优化）
+## 建议落实情况（截至昇腾分支 `f188929`）
 
 | 工作项 | 后续结果 |
 | --- | --- |
 | 核对真实布局及 Q2 小 batch 启动开销 | 已对照 packed QKV、列视图状态索引、slot 顺序与预分配 `out`。主机启动路径做过配对实验，最终保留通用 `libentry/libtuner`。在 `209e5c7` 的仓库标准计时下，Q2/TP8/B32 的 H800 同机 SpeedUp 为 Kernel 1.121×、Graph 1.048×。下文原始 eager 数据采用另一种计时协议。 |
 | 检查 Graph 配置与窗口内核 | 已加入 `batch × heads` 的 workload 分桶。Q2/Q4 全局外提 `dt_bias` 及 Q4/Q8 满窗特化均做过实验；交付代码保留 Q8 外提。各轮配置和回退依据见优化记录第 2、5、6 节。 |
-| 后续新增的厂商基线 | 精度和同机性能已按安装版 native 的签名适配两种缓存布局。NV 采集与目标机 benchmark 已对齐 `out` 预分配和用例键。待验证项是 PPU 真机冷启动，以及在 NV、目标机之间跑通实测折算。 |
+| 后续新增的厂商基线 | 精度和同机性能已按安装版 native 的签名适配两种缓存布局。H800 已采集 26 条基线，Ascend910B4-1 已完成 10 个 BF16 生产形状的同机比较和跨芯片折算。PPU 真机冷启动仍待确认。 |
 | Ascend 独立后端与 persistent Vector | 新增独立后端，显式关闭 auto-blockify，并按 40 个 Vector 核实现 program 内多 tile 循环。Q2/B32 使用连续工作区间、固定 BV64 和分桶 `dt_bias` 外提，延迟由首版 132.572 µs 降至 100.656 µs；完整 92 项功能测试及仓库 benchmark 通过。详见优化记录第 9 节。 |
 
 跨平台版本对应、提交号、采集命令及验证范围见[优化记录第 8 节](kda_recoverssm_verify_optimization.md#8-多平台精度和性能基线2026-11-25)，Ascend 宏问题、persistent 设计、profiler 数据和最终性能见[优化记录第 9 节](kda_recoverssm_verify_optimization.md#9-ascend-独立后端与-persistent-vector-优化2026-11-26)。以下保留 `d934b34` 时的判断和实验设计，便于追溯每项建议的依据。

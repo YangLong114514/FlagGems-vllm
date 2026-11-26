@@ -1,6 +1,6 @@
 # KDA RecoverSSM Verify 优化记录
 
-第 1–7 节记录 NVIDIA H800 上的历史实验，基线为 vLLM 0.34.0 Triton kernel，输入为 BF16 activation 和 FP32 checkpoint state。第 3 节的生产性能表最后更新于原分支 `feat/kda-recoverssm-verify` 的 `d6c8e1a`，对应当前分支 rebase 后的 `209e5c7`。第 8 节记录此后 `feat/metax-kda-recoverssm-verify-baseline` 截至 `d99f996` 的开发。两个提交之间的产品 verify kernel 源文件相同，后续改动集中在测试、基线和性能采集。
+第 1–7 节记录 NVIDIA H800 上的历史实验，基线为 vLLM 0.34.0 Triton kernel，输入为 BF16 activation 和 FP32 checkpoint state。第 3 节的生产性能表最后更新于原分支 `feat/kda-recoverssm-verify` 的 `d6c8e1a`，对应当前分支 rebase 后的 `209e5c7`。第 8 节记录多平台测试基线。第 9 节记录昇腾独立后端（`6cfd3f5`）、切换到昇腾 native 基线（`99d8b5b`）和 Ascend910B4-1 上的 persistent kernel 实测（`f188929`）。
 
 ## 1. 算子特征与优化约束
 
@@ -279,7 +279,7 @@ python -m pytest -q -s benchmark/test_kda_recoverssm_verify.py --base-data tools
 
 `SpeedUp` 是目标机 native 延迟除以同机 FlagGems 延迟。`vs Base` 是 NV native 延迟除以目标机 FlagGems 延迟，再除以硬件系数。该系数按 NV 记录的瓶颈资源选择，为目标芯片与参考芯片对应带宽或计算能力的比值。检查日志中的 `factor=`；值为 `None` 时，显示的是未经折算的延迟比。[折算实现](benchmark/base.py) · [采集器](tools/collect_baseline_nvidia.py)
 
-截至 `d99f996`，两套 native 接口各 26 组已用 CPU 和 meta 张量验证 NCU 脚本的输入重建、输出预分配和 JSON 匹配。该适配尚待在 NV 参考机采集实际延迟与 NCU 瓶颈，再在目标机核对硬件系数和 `vs Base`。第 3 节的 H800 实测表保留原测量口径。
+截至 `d99f996`，两套 native 接口各 26 组已用 CPU 和 meta 张量验证 NCU 脚本的输入重建、输出预分配和 JSON 匹配。`1c4d55c` 随后提交了 H800 上 vLLM 0.34.0 的 26 条实测记录，包含延迟和 NCU 瓶颈分类。第 9.5 节给出了其中 10 个 BF16 生产形状在 Ascend910B4-1 上的折算结果。[H800 采集数据及环境](tools/kda_recoverssm_verify_base.json)
 
 
 ## 9. Ascend 独立后端与 persistent Vector 优化（2026-11-26）
@@ -341,7 +341,7 @@ program 数对照（目标 shape，BV64）：
 | 48 | 157.525 µs |
 | 64 | 122.984 µs |
 
-40 个 program 最优。BV64 共 384 个 tile，24 个 program 处理 10 个 tile，另外 16 个处理 9 个，尾部差约 4%，与当前同旧宏路径的剩余差距基本一致。32/48/64 均因有效并行度或波次安排变差而未采用。
+这组实测中，40 个 program 的延迟最低。按最终代码，Q2/TP8/B32 有 32 个请求、每个请求 12 个 head，每个 head 沿 V 切为 128 / 64 = 2 个 tile，共 768 个。连续分块的步长为 `ceil(768 / 40) = 20`：program 0–37 各处理 20 个 tile，38 号处理 8 个，39 号分到 0 个。与旧宏路径相比，100.656 µs 对 96.693 µs 的差距约为 4.1%。要量化分块对这段差距的贡献，可以固定 BV64 和 40 个 program，对照按商和余数均分的方案（8 个各 20 tile，32 个各 19 tile），复测设备延迟和 AIV scalar time。[昇腾调度实现](src/flaggems_vllm/runtime/backend/_ascend/ops/kda_recoverssm_verify.py)
 
 ### 9.5 当前生产 Shape 性能
 
@@ -361,6 +361,8 @@ program 数对照（目标 shape，BV64）：
 | k3_tp1_spec3_bs16 | 27.374763 | 0.704579 | 38.853 | 0.507 | 0.697657 |
 
 除目标 Q2/B32 与旧宏路径仍有约 4% 差距外，其余形状延迟差大多在约 1% 内，Q4/B32 和 Q8/B32 已略快于旧宏路径。首版 persistent Q2/B32 为 132.572 µs，最终为 100.656 µs，下降约 24.1%。
+
+Q8/TP8/B32 的两列比值可分别复算。同机 `SpeedUp = 3.492046 / 0.371555 = 9.398`。该形状在 H800 的 BF16 记录中耗时 0.076416 ms，NCU 瓶颈标为 `cuda`，仓库按 benchmark 的 BF16 输入类型取 Ascend910B4 的 vector 系数 0.024876，得到 `vs Base = 0.076416 / 0.371555 / 0.024876 = 8.268`。其余 9 个生产形状在 H800 上均标为 `mem`，对应带宽系数 0.389412。这解释了为何 Q8 的折算值明显高于表中其他行。[H800 逐形状记录与芯片系数](tools/kda_recoverssm_verify_base.json) · [benchmark 折算逻辑](benchmark/base.py)
 
 ### 9.6 验证、限制和后续方向
 
