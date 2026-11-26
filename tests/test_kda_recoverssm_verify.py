@@ -48,8 +48,8 @@ def reference(case, inputs):
     requests) are not stored by the kernel and must not be compared.
     """
     case = Case(*case)
-    if gems.vendor_name == "mthreads":
-        # MUSA lacks FP64. Run the independent oracle on the host.
+    if not gems.runtime.device.support_fp64:
+        # Move inputs to the host before the oracle's first FP64 operation.
         inputs = {
             key: value.cpu() if isinstance(value, torch.Tensor) else value
             for key, value in inputs.items()
