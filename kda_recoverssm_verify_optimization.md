@@ -280,3 +280,101 @@ python -m pytest -q -s benchmark/test_kda_recoverssm_verify.py --base-data tools
 `SpeedUp` 是目标机 native 延迟除以同机 FlagGems 延迟。`vs Base` 是 NV native 延迟除以目标机 FlagGems 延迟，再除以硬件系数。该系数按 NV 记录的瓶颈资源选择，为目标芯片与参考芯片对应带宽或计算能力的比值。检查日志中的 `factor=`；值为 `None` 时，显示的是未经折算的延迟比。[折算实现](benchmark/base.py) · [采集器](tools/collect_baseline_nvidia.py)
 
 截至 `d99f996`，两套 native 接口各 26 组已用 CPU 和 meta 张量验证 NCU 脚本的输入重建、输出预分配和 JSON 匹配。该适配尚待在 NV 参考机采集实际延迟与 NCU 瓶颈，再在目标机核对硬件系数和 `vs Base`。第 3 节的 H800 实测表保留原测量口径。
+
+
+## 9. Ascend 独立后端与 persistent Vector 优化（2026-11-26）
+
+### 9.1 接入范围和计时口径
+
+本次在 `feat/ascend-kda-recoverssm-verify` 上新增了独立实现 `src/flaggems_vllm/runtime/backend/_ascend/ops/kda_recoverssm_verify.py` 和配置项 `kda_recoverssm_verify_ascend`。Ascend 顶层调用由后端注册表覆盖，通用/NVIDIA kernel 及其配置不变。分支同时保留第 8 节的 native 签名适配：NPU 直接使用安装版 `vllm_ascend.ops.triton.kda.recoverssm`，沐曦继续通过独立 worker 处理厂商库的导入顺序。
+
+以下 Ascend 数据均来自 Ascend910B4-1、BF16 activation、FP32 checkpoint state，采用仓库 `do_bench_npu` 纯设备 kernel 口径。H800 离线数据仍使用 `tools/kda_recoverssm_verify_base.json`，因此 `vs Base` 的定义和硬件折算系数与第 8.3 节相同，不与独立 NPU event 脚本混用。
+
+### 9.2 全局 auto-blockify 开关问题
+
+rebase 后的 `main` 引入 `_ascend/ops/deep_gemm_fp8_o_proj.py`。该模块在导入和自身调用期间清除 `TRITON_ALL_BLOCKS_PARALLEL`，以避免 deep_gemm 在该模式下错算。旧 MetaX 分支由 `flag_gems` 设置为 1；变量被清除后，KDA 三维 grid 进入低效调度路径。主机提交仍只有约 0.4 ms，慢速来自设备执行/调度，而不是 Python 或重复 autotune。
+
+交叉验证结果（Q2/TP8）：
+
+| 运行条件 | B32 | B128 |
+| --- | ---: | ---: |
+| 新分支，变量被清除 | 0.907 ms | 13.500 ms |
+| 新分支，恢复为 1 | 0.330 ms | 0.380 ms |
+| 旧分支，原始变量为 1 | 0.354 ms | 0.377 ms |
+| 旧分支，手动清除变量 | 0.908 ms | 13.484 ms |
+
+这解释了“仅切换分支时 `vs Base` 与 Gems SpeedUp 方向相反”：两个分支的全局调度模式、native 实现和 Gems 绝对延迟都不同，不能只归因于后端注册。
+
+本次**没有恢复或重新开启全局宏**。KDA 显式传入 `enable_auto_blockify=False`，并在算子内部实现等价的持久并行调度，避免继承 deep_gemm 的计算污染风险。deep_gemm 自身的全局环境处理不属于本次 KDA 修改范围。
+
+### 9.3 persistent Vector 实现
+
+通过 `get_device_core_counts(device)` 查询并按设备缓存物理核数，当前机器为 40 个 Vector 核和 20 个 Cube 核。实现参考 `_ascend/ops/pack_seq.py` 和 `_ascend/ops/mhc_post.py` 的 persistent 模式：
+
+- 一维 grid 启动 `min(vector_core_num, total_work)` 个 program，不再启动 `(V tile, request, head)` 三维 grid。
+- 通用路径使用 `for work_id in range(pid, total_work, tl.num_programs(0))`，每个 program 处理多个独立 tile，原递推和 records 写入逻辑封装在 tile helper 中。
+- `Q2 + WORKLOAD_BUCKET=512` 使用连续工作区间及编译期可确定的 `work_per_core`，降低小 workload 的动态步长和标量管理开销；其他 workload 保留 strided 循环，因为全局套用连续区间会回退约 5%。
+- NULL 请求不提前从 JIT 子函数返回，而是安全读取槽位 0 并把 `query_len` 置零，绕开 Ascend 对带指针参数子函数提前返回的转换限制，同时保持输出和 records 语义。
+- 当前固定 `BV=64, num_warps=8, num_stages=2`。BV128 在 910B4 上因 UB 需求 1,857,536 bits 超过可用 1,572,864 bits，未采用。
+
+最终配置只需一个候选，避免 Q2/B32 在不同源码和调优缓存状态下误选 BV32。`WORKLOAD_BUCKET` 仍参与 dispatch key，Q2/B32 的连续调度也按该桶启用。
+
+### 9.4 B32 profiler 与专项调整
+
+首版 persistent Q2/B32 为 132.572 µs，旧宏路径为 96.693 µs。Profiler 对比显示：
+
+| 指标 | 旧宏路径 | 首版 persistent | 变化 |
+| --- | ---: | ---: | ---: |
+| Duration | 96.935 µs | 132.565 µs | +36.8% |
+| AIV total cycles | 6.059 M | 8.492 M | +40.2% |
+| AIV scalar time | 24.187 µs | 41.807 µs | +72.8% |
+| Cube utilization | 0 | 0 | 无差异 |
+
+因此瓶颈主要是 persistent 循环的标量、地址计算和调度管理，而不是 Cube 或单纯内存带宽。连续工作区间将该 shape 降到约 102 µs；随后仅在目标分桶和原有 Q8 路径外提 `dt_bias`，进一步降到约 101 µs。其他 Q2 恢复逐 token 加载，消除全局外提造成的约 2% 回退。
+
+program 数对照（目标 shape，BV64）：
+
+| Programs | Latency |
+| ---: | ---: |
+| 32 | 120.321 µs |
+| **40** | **100.648 µs** |
+| 48 | 157.525 µs |
+| 64 | 122.984 µs |
+
+40 个 program 最优。BV64 共 384 个 tile，24 个 program 处理 10 个 tile，另外 16 个处理 9 个，尾部差约 4%，与当前同旧宏路径的剩余差距基本一致。32/48/64 均因有效并行度或波次安排变差而未采用。
+
+### 9.5 当前生产 Shape 性能
+
+下表使用最终代码和最终调优配置。`旧宏 Gems` 仅用于比较绝对 kernel 延迟；旧分支使用另一套 native，不能用两个 SpeedUp 的比值判断优化收益。
+
+| Case | Ascend native (ms) | 当前 Gems (ms) | Gems SpeedUp | vs Base | 旧宏 Gems (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| k3_tp8_mtp1_bs32 | 0.951139 | 0.100656 | 9.449 | 0.712 | 0.096693 |
+| k3_tp8_mtp1_bs128 | 14.305375 | 0.355689 | 40.219 | 0.527 | 0.353485 |
+| k3_tp8_mtp1_bs256 | 57.392500 | 0.714459 | 80.330 | 0.452 | 0.704790 |
+| k3_tp8_spec3_bs32 | 1.798503 | 0.186843 | 9.626 | 0.610 | 0.193517 |
+| k3_tp8_spec3_bs128 | 27.325688 | 0.704153 | 38.806 | 0.506 | 0.696283 |
+| k3_tp8_win8_bs32 | 3.492046 | 0.371555 | 9.398 | 8.268 | 0.372113 |
+| k3_tp4_mtp1_bs64 | 14.328733 | 0.354241 | 40.449 | 0.532 | 0.354147 |
+| k3_tp2_mtp1_bs64 | 57.163014 | 0.712505 | 80.228 | 0.457 | 0.704675 |
+| k3_tp1_mtp1_bs8 | 3.646031 | 0.182269 | 20.004 | 0.658 | 0.181677 |
+| k3_tp1_spec3_bs16 | 27.374763 | 0.704579 | 38.853 | 0.507 | 0.697657 |
+
+除目标 Q2/B32 与旧宏路径仍有约 4% 差距外，其余形状延迟差大多在约 1% 内，Q4/B32 和 Q8/B32 已略快于旧宏路径。首版 persistent Q2/B32 为 132.572 µs，最终为 100.656 µs，下降约 24.1%。
+
+### 9.6 验证、限制和后续方向
+
+最终验证命令及结果：
+
+```bash
+PYTHONPATH=src python -m pytest -q tests/test_kda_recoverssm_verify.py
+# 92 passed
+
+PYTHONPATH=src python -m pytest -q -s benchmark/test_kda_recoverssm_verify.py \
+  --level core --base-data tools/kda_recoverssm_verify_base.json
+# 1 passed，结果见第 9.5 节
+```
+
+生产路径 `no_torch_fallback` 检查为 0 violations，`py_compile` 和 `git diff --check` 通过。功能覆盖 BF16/FP16 activation、FP32/BF16 state、Q2/Q4/Q8、ragged、NULL checkpoint、预分配 `out` 和接口异常路径；性能表只覆盖 Ascend910B4-1 的 BF16 生产形状，未验证 A5。
+
+当前 kernel 仍以 FP32 逐元素运算、归一化、指数/sigmoid 和矩阵-向量归约为主，编译模式为 `mix_mode='aiv'`。虽然已确认存在 20 个 Cube 核，但简单改成 20 个 program 或一次 `tl.dot` 并不能有效利用它们；后续若继续优化，需要单独设计适合 GEMM 的数据布局，不能与 persistent 修复混为一轮。Q2/B32 的剩余约 4% 差距可从尾波负载均衡和 host/设备调度进一步分析，但不建议重新启用全局宏。

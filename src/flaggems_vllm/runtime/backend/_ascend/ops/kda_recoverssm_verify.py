@@ -2,10 +2,12 @@
 # Copyright 2026 FlagOS Contributors
 """Ascend implementation of KDA RecoverSSM speculative verify.
 
-This backend starts with the common kernel semantics and owns its launch and
-tuning policy independently of the generic implementation.
+The common recurrence is executed by a persistent Vector-core kernel. Each
+program walks multiple work tiles, avoiding the global auto-blockify switch and
+its cross-operator correctness risks.
 """
 
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -13,11 +15,18 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
+from flaggems_vllm.runtime.backend._ascend.device import get_device_core_counts
 from flaggems_vllm.utils import libentry, libtuner
 
 # Matches vllm.v1.attention.backends.utils.NULL_BLOCK_ID; requests whose
 # checkpoint slot is <= null_block_id have no state and produce zero outputs.
 DEFAULT_NULL_BLOCK_ID = 0
+
+
+@lru_cache(maxsize=None)
+def _vector_core_count(device: torch.device) -> int:
+    return get_device_core_counts(device)[1]
+
 
 @triton.jit
 def _kda_gate(
@@ -65,13 +74,8 @@ def _kda_recurrent_step(
     return state + correction[:, None] * normalized_k[None, :], correction
 
 
-@libentry()
-@libtuner(
-    configs=runtime.get_tuned_config("kda_recoverssm_verify_ascend"),
-    key=["K", "V", "SPEC_QUERY_LEN", "WORKLOAD_BUCKET"],
-)
 @triton.jit
-def _ascend_kda_recoverssm_verify_kernel(
+def _ascend_kda_recoverssm_verify_tile_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -107,6 +111,9 @@ def _ascend_kda_recoverssm_verify_kernel(
     stride_out_token,
     stride_query_start_loc,
     stride_state_indices,
+    work_id,
+    NUM_HEADS: tl.constexpr,
+    CONTIGUOUS_WORK: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BK: tl.constexpr,
@@ -115,9 +122,10 @@ def _ascend_kda_recoverssm_verify_kernel(
     USE_LOWER_BOUND: tl.constexpr,
     WORKLOAD_BUCKET: tl.constexpr,
 ):
-    pid_v = tl.program_id(0)
-    pid_b = tl.program_id(1)
-    pid_h = tl.program_id(2)
+    value_tiles = tl.cdiv(V, BV)
+    pid_v = work_id % value_tiles
+    pid_b = work_id // (value_tiles * NUM_HEADS)
+    pid_h = (work_id // value_tiles) % NUM_HEADS
 
     bos = tl.load(query_start_loc_ptr + pid_b * stride_query_start_loc).to(tl.int64)
     eos = tl.load(query_start_loc_ptr + (pid_b + 1) * stride_query_start_loc).to(
@@ -145,8 +153,9 @@ def _ascend_kda_recoverssm_verify_kernel(
                 tl.zeros([BV], dtype=tl.float32),
                 mask=token_valid & mask_v,
             )
-        return
+        query_len = tl.zeros((), dtype=tl.int64)
 
+    state_idx = tl.maximum(state_idx, 0)
     state_ptrs = (
         state_ptr
         + state_idx * stride_state_block
@@ -156,7 +165,7 @@ def _ascend_kda_recoverssm_verify_kernel(
     )
     state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
     A = tl.exp(tl.load(A_log_ptr + pid_h).to(tl.float32))
-    if SPEC_QUERY_LEN == 8:
+    if SPEC_QUERY_LEN == 8 or CONTIGUOUS_WORK:
         dt_bias = tl.load(
             dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0
         ).to(tl.float32)
@@ -191,7 +200,7 @@ def _ascend_kda_recoverssm_verify_kernel(
             ).to(tl.float32)
 
             q *= tl.rsqrt(tl.sum(q * q) + 1e-6) * (K**-0.5)
-            if SPEC_QUERY_LEN != 8:
+            if SPEC_QUERY_LEN != 8 and not CONTIGUOUS_WORK:
                 dt_bias = tl.load(
                     dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0
                 ).to(tl.float32)
@@ -243,6 +252,123 @@ def _ascend_kda_recoverssm_verify_kernel(
                     raw_g,
                     mask=mask_k,
                 )
+
+
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("kda_recoverssm_verify_ascend"),
+    key=["K", "V", "SPEC_QUERY_LEN", "WORKLOAD_BUCKET"],
+)
+@triton.jit
+def _ascend_kda_recoverssm_verify_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    raw_g_ptr,
+    raw_beta_ptr,
+    A_log_ptr,
+    dt_bias_ptr,
+    state_ptr,
+    correction_cache_ptr,
+    kg_cache_ptr,
+    out_ptr,
+    query_start_loc_ptr,
+    state_indices_ptr,
+    lower_bound,
+    null_block_id,
+    stride_q_token,
+    stride_k_token,
+    stride_v_token,
+    stride_g_token,
+    stride_beta_token,
+    stride_state_block,
+    stride_state_head,
+    stride_state_v,
+    stride_state_k,
+    stride_correction_row,
+    stride_correction_head,
+    stride_correction_pos,
+    stride_correction_dim,
+    stride_kg_row,
+    stride_kg_head,
+    stride_kg_pos,
+    stride_kg_dim,
+    stride_out_token,
+    stride_query_start_loc,
+    stride_state_indices,
+    BATCH: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    NUM_VECTOR_CORES: tl.constexpr,
+    CONTIGUOUS_WORK: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    SPEC_QUERY_LEN: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    WORKLOAD_BUCKET: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    value_tiles = tl.cdiv(V, BV)
+    total_work = BATCH * NUM_HEADS * value_tiles
+    if CONTIGUOUS_WORK:
+        num_programs = min(NUM_VECTOR_CORES, total_work)
+        work_per_core = tl.cdiv(total_work, num_programs)
+        first_work = pid * work_per_core
+        last_work = min(first_work + work_per_core, total_work)
+        step = 1
+    else:
+        first_work = pid
+        last_work = total_work
+        step = tl.num_programs(0)
+    for work_id in range(first_work, last_work, step):
+        _ascend_kda_recoverssm_verify_tile_kernel(
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            raw_g_ptr,
+            raw_beta_ptr,
+            A_log_ptr,
+            dt_bias_ptr,
+            state_ptr,
+            correction_cache_ptr,
+            kg_cache_ptr,
+            out_ptr,
+            query_start_loc_ptr,
+            state_indices_ptr,
+            lower_bound,
+            null_block_id,
+            stride_q_token,
+            stride_k_token,
+            stride_v_token,
+            stride_g_token,
+            stride_beta_token,
+            stride_state_block,
+            stride_state_head,
+            stride_state_v,
+            stride_state_k,
+            stride_correction_row,
+            stride_correction_head,
+            stride_correction_pos,
+            stride_correction_dim,
+            stride_kg_row,
+            stride_kg_head,
+            stride_kg_pos,
+            stride_kg_dim,
+            stride_out_token,
+            stride_query_start_loc,
+            stride_state_indices,
+            work_id,
+            NUM_HEADS,
+            CONTIGUOUS_WORK,
+            K,
+            V,
+            BK,
+            BV,
+            SPEC_QUERY_LEN,
+            USE_LOWER_BOUND,
+            WORKLOAD_BUCKET,
+        )
 
 
 def kda_recoverssm_verify(
@@ -355,9 +481,10 @@ def kda_recoverssm_verify(
         state_indices.stride(0),
     )
     grid = lambda meta: (  # noqa: E731
-        triton.cdiv(value_dim, meta["BV"]),
-        batch,
-        num_heads,
+        min(
+            _vector_core_count(device),
+            batch * num_heads * triton.cdiv(value_dim, meta["BV"]),
+        ),
     )
     _ascend_kda_recoverssm_verify_kernel[grid](
         q,
@@ -376,11 +503,16 @@ def kda_recoverssm_verify(
         gate_lower_bound,
         null_block_id,
         *strides,
+        BATCH=batch,
+        NUM_HEADS=num_heads,
+        NUM_VECTOR_CORES=_vector_core_count(device),
+        CONTIGUOUS_WORK=spec_query_len == 2 and workload_bucket == 512,
         K=key_dim,
         V=value_dim,
         BK=block_k,
         SPEC_QUERY_LEN=spec_query_len,
         USE_LOWER_BOUND=use_lower_bound,
         WORKLOAD_BUCKET=workload_bucket,
+        enable_auto_blockify=False,
     )
     return out

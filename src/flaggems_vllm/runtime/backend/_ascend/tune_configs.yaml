@@ -517,6 +517,6 @@ gumbel_sample_streaming_row:
     num_stages: 1
 
 kda_recoverssm_verify_ascend:
-  - META: {BV: 32}
-    num_warps: 4
-    num_stages: 1
+  - META: {BV: 64}
+    num_warps: 8
+    num_stages: 2
