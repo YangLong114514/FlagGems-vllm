@@ -249,10 +249,11 @@ NCU 2025.4.1 已在开发机的工作区本地解压使用，没有修改系统 
 
 ### 8.1 原生实现与缓存布局
 
-沐曦和摩尔曾在测试中使用仓库内复制的 vLLM 0.34.0 kernel（`df10933`、`6cb47ba`、`fa67218`）。`de9b4c9` 移除了这份副本。现在精度用例和 benchmark 都直接导入机器上安装的 `vllm.models.kimi_k3.nvidia.ops.recoverssm.kda_recoverssm_verify`，按函数签名构造输入。该入口用于独立测量 verify；模型推理时的分派需要另行确认。[基线实现](baseline/kda_recoverssm_verify.py)
+沐曦和摩尔曾在测试中使用仓库内复制的 vLLM 0.34.0 kernel（`df10933`、`6cb47ba`、`fa67218`）。`de9b4c9` 移除了这份副本。精度用例和同机 benchmark 共用一个 native 入口。昇腾使用已安装的 `vllm_ascend.ops.triton.kda.recoverssm.kda_recoverssm_verify`，其他平台使用 `vllm.models.kimi_k3.nvidia.ops.recoverssm.kda_recoverssm_verify`。测试按实际函数签名构造输入。[基线实现](baseline/kda_recoverssm_verify.py)
 
 | 已核对的版本 | verify 写入位置及测试处理 |
 | --- | --- |
+| vLLM Ascend v0.32.0rc1 | 昇腾 Triton kernel 接收 `correction_cache` 和 `kg_cache`，精度用例按 `state_indices` 取回各请求的有效记录。 |
 | 沐曦 0.29、摩尔 0.32、海光 0.28.1+dtk2604 | native 接收 `correction_cache` 和 `kg_cache`，请求 `b` 写入物理块 `state_indices[b]`；断言前按请求顺序取回有效记录。海光文件与官方 v0.28.1rc0、v0.29.0 及沐曦样本逐字节一致。摩尔样本的差异在 commit 阶段的块边界计算，verify 相同（`afdf148`）。 |
 | 官方 v0.33.0、v0.34.0 | native 接收 `records`，请求 `b` 写入第 `b` 行，与 FlagGems 的接口一致。官方 0.33.0 兼容性记录于 `eb9a7fa`。 |
 

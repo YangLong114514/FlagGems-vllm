@@ -30,6 +30,11 @@ NULL_BLOCK_ID = 0  # vLLM's reserved block for requests without a checkpoint.
 def native():
     from vllm.platforms import current_platform
 
+    if current_platform.device_type == "npu":
+        from vllm_ascend.ops.triton.kda.recoverssm import kda_recoverssm_verify
+
+        return kda_recoverssm_verify
+
     capability_probe = nullcontext()
     if hasattr(type(current_platform), "is_ppu") and current_platform.is_ppu():
         from vllm.platforms.interface import DeviceCapability
