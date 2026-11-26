@@ -90,6 +90,9 @@ from flaggems_vllm.runtime.backend._ascend.ops.indexer_k_quant_and_cache import 
 from flaggems_vllm.runtime.backend._ascend.ops.kda_gate_cumsum import (
     kda_gate_cumsum_triton,
 )
+from flaggems_vllm.runtime.backend._ascend.ops.kda_recoverssm_verify import (
+    kda_recoverssm_verify,
+)
 from flaggems_vllm.runtime.backend._ascend.ops.kpool_state_compress import (
     glm5_next_kpool_state_compress_and_write_cache_triton as kpool_state_compress,
 )
@@ -186,6 +189,7 @@ __all__ = [
     "indexer_k_quant_and_cache",
     "inplace_fused_experts",
     "kda_gate_cumsum_triton",
+    "kda_recoverssm_verify",
     "kpool_state_compress",
     "kv_rmsnorm_rope_cache",
     "lightning_indexer",

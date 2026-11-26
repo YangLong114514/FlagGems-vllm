@@ -515,3 +515,8 @@ gumbel_sample_streaming_row:
       TILE_SIZE: 4096
     num_warps: 4
     num_stages: 1
+
+kda_recoverssm_verify_ascend:
+  - META: {BV: 32}
+    num_warps: 4
+    num_stages: 1
