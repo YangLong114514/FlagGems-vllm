@@ -8,7 +8,9 @@ then checked against the native outputs on Kimi K3 production shapes and
 against the interface contract of the vLLM kernel.
 """
 
+import multiprocessing
 import types
+from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 
 import pytest
@@ -19,7 +21,6 @@ import flaggems_vllm as gems
 from baseline import kda_recoverssm_verify as baseline
 from baseline.kda_recoverssm_verify import PERF_CASES, Case
 from flaggems_vllm.runtime import torch_device_fn
-from tests.kda_recoverssm_worker import kda_worker  # noqa: F401
 
 pytestmark = [
     pytest.mark.skipif(
@@ -38,6 +39,20 @@ PRECISIONS = [
 # bf16/fp16 outputs are produced by fp32 math rounded once on store.
 OUT_TOL = {torch.float16: 1.5e-2, torch.bfloat16: 3e-2}
 CORRECTION_TOL = 1e-3  # records.correction is stored in fp32
+
+
+@pytest.fixture(scope="module")
+def kda_worker():
+    if gems.vendor_name != "metax":
+        yield None
+        return
+    with ProcessPoolExecutor(
+        max_workers=1,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=baseline.init_metax_worker,
+        initargs=(gems.runtime.torch_device_fn.current_device(),),
+    ) as pool:
+        yield pool
 
 
 def reference(case, inputs):
@@ -127,9 +142,7 @@ def assert_records_match(case, inputs, records, ref_corr, written):
 
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c.name for c in PERF_CASES])
 @pytest.mark.parametrize("dtype,state_dtype", PRECISIONS)
-def test_native_against_torch_oracle(
-    case, dtype, state_dtype, kda_worker
-):  # noqa: F811
+def test_native_against_torch_oracle(case, dtype, state_dtype, kda_worker):
     if kda_worker is not None:
         return kda_worker.submit(
             _native_against_torch_oracle, case, dtype, state_dtype
@@ -159,7 +172,7 @@ def _native_against_torch_oracle(case, dtype, state_dtype):
 
 @pytest.mark.parametrize("case", PERF_CASES, ids=[c.name for c in PERF_CASES])
 @pytest.mark.parametrize("dtype,state_dtype", PRECISIONS)
-def test_gems_matches_native(case, dtype, state_dtype, kda_worker):  # noqa: F811
+def test_gems_matches_native(case, dtype, state_dtype, kda_worker):
     if kda_worker is not None:
         return kda_worker.submit(
             _gems_matches_native, case, dtype, state_dtype

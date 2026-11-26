@@ -50,6 +50,12 @@ def native():
     return kda_recoverssm_verify
 
 
+def init_metax_worker(device_index):
+    # spawn imports this module before the test module; register mcoplib first.
+    torch.cuda.set_device(device_index)
+    native()
+
+
 def _uses_block_cache():
     params = inspect.signature(native()).parameters
     if "records" in params:

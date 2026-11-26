@@ -260,7 +260,7 @@ NCU 2025.4.1 已在开发机的工作区本地解压使用，没有修改系统 
 
 ### 8.2 厂商导入与计时
 
-- **沐曦**（`154320a`）。精度和性能用例使用同一套进程隔离逻辑，在通过 `spawn` 启动的子进程中先导入 native，让 mcoplib 先注册，再加载 FlagGems 测试代码。导入顺序由 KDA 用例控制。[子进程初始化](tests/kda_recoverssm_worker.py)
+- **沐曦**（`154320a`）。精度和性能用例使用同一套进程隔离逻辑，在通过 `spawn` 启动的子进程中先导入 native，让 mcoplib 先注册，再加载 FlagGems 测试代码。导入顺序由 KDA 用例控制。[KDA fixture](tests/test_kda_recoverssm_verify.py) · [子进程初始化](baseline/kda_recoverssm_verify.py)
 - **平头哥**（`3f61b93`、`d2b5dca`）。首次导入 Kimi K3 触发 CUTLASS 能力探测，SAIL 继承的 NVML 查询因缺少 `libnvidia-ml.so.1` 失败。最终实现仅在 PPU 导入 native 期间，用 `torch.cuda.get_device_capability(device_id)` 构造 vLLM 的 `DeviceCapability`，退出后恢复平台方法。已做模拟导入验证，仍待在原 PPU 容器的新进程里单跑首例确认。[导入实现](baseline/kda_recoverssm_verify.py)
 - **摩尔**。排查时 MUSA stream、Graph capture 和 replay 均通过，报错发生在该镜像的 Triton Graph timer 调用 `torch.cuda.current_stream()`。KDA benchmark 使用仓库通用计时；该分支没有算子专用的 MUSA timer。复核性能时应记录镜像版本及实际计时模式。[性能用例](benchmark/test_kda_recoverssm_verify.py)
 
