@@ -75,6 +75,267 @@ def _kda_recurrent_step(
 
 
 @triton.jit
+def _kda_prepared_step(state, normalized_k, q, v, decay, beta):
+    state *= decay[None, :]
+    state_q = tl.sum(state * q[None, :], axis=1)
+    correction = v - tl.sum(state * normalized_k[None, :], axis=1)
+    correction *= beta
+    return state + correction[:, None] * normalized_k[None, :], correction, state_q
+
+
+@triton.jit
+def _ascend_kda_recoverssm_verify_pair_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    raw_g_ptr,
+    raw_beta_ptr,
+    A_log_ptr,
+    dt_bias_ptr,
+    state_ptr,
+    correction_cache_ptr,
+    kg_cache_ptr,
+    out_ptr,
+    query_start_loc_ptr,
+    state_indices_ptr,
+    lower_bound,
+    null_block_id,
+    stride_q_token,
+    stride_k_token,
+    stride_v_token,
+    stride_g_token,
+    stride_beta_token,
+    stride_state_block,
+    stride_state_head,
+    stride_state_v,
+    stride_state_k,
+    stride_correction_row,
+    stride_correction_head,
+    stride_correction_pos,
+    stride_correction_dim,
+    stride_kg_row,
+    stride_kg_head,
+    stride_kg_pos,
+    stride_kg_dim,
+    stride_out_token,
+    stride_query_start_loc,
+    stride_state_indices,
+    work_id,
+    NUM_HEADS: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    SPEC_QUERY_LEN: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+):
+    pid_b = work_id // NUM_HEADS
+    pid_h = work_id % NUM_HEADS
+    bos = tl.load(query_start_loc_ptr + pid_b * stride_query_start_loc).to(tl.int64)
+    eos = tl.load(query_start_loc_ptr + (pid_b + 1) * stride_query_start_loc).to(
+        tl.int64
+    )
+    query_len = eos - bos
+    state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(tl.int64)
+    offs_k = tl.arange(0, K)
+    offs_v = tl.arange(0, BV)
+    if state_idx <= null_block_id:
+        for token_offset in tl.static_range(SPEC_QUERY_LEN):
+            token_valid = token_offset < query_len
+            for pid_v in tl.static_range(V // BV):
+                tl.store(
+                    out_ptr
+                    + (bos + token_offset) * stride_out_token
+                    + pid_h * V
+                    + pid_v * BV
+                    + offs_v,
+                    tl.zeros([BV], dtype=tl.float32),
+                    mask=token_valid,
+                )
+        query_len = tl.zeros((), dtype=tl.int64)
+    state_idx = tl.maximum(state_idx, 0)
+    A = tl.exp(tl.load(A_log_ptr + pid_h).to(tl.float32))
+    dt_bias = tl.load(dt_bias_ptr + pid_h * K + offs_k).to(tl.float32)
+
+    for token_offset in tl.static_range(SPEC_QUERY_LEN):
+        token = bos + token_offset
+        token_valid = token_offset < query_len
+        q = tl.load(
+            q_ptr + token * stride_q_token + pid_h * K + offs_k,
+            mask=token_valid,
+            other=0.0,
+        ).to(tl.float32)
+        k = tl.load(
+            k_ptr + token * stride_k_token + pid_h * K + offs_k,
+            mask=token_valid,
+            other=0.0,
+        ).to(tl.float32)
+        raw_g = tl.load(
+            raw_g_ptr + token * stride_g_token + pid_h * K + offs_k,
+            mask=token_valid,
+            other=0.0,
+        ).to(tl.float32)
+        raw_beta = tl.load(
+            raw_beta_ptr + token * stride_beta_token + pid_h,
+            mask=token_valid,
+            other=0.0,
+        ).to(tl.float32)
+        q *= tl.rsqrt(tl.sum(q * q) + 1e-6) * (K**-0.5)
+        normalized_k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
+        normalized_k_q = tl.sum(normalized_k * q)
+        gate = _kda_gate(raw_g, dt_bias, A, lower_bound, USE_LOWER_BOUND)
+        tl.store(
+            kg_cache_ptr
+            + pid_b * stride_kg_row
+            + pid_h * stride_kg_head
+            + token_offset * stride_kg_pos
+            + offs_k * stride_kg_dim,
+            k,
+            mask=token_valid,
+        )
+        tl.store(
+            kg_cache_ptr
+            + pid_b * stride_kg_row
+            + pid_h * stride_kg_head
+            + token_offset * stride_kg_pos
+            + (K + offs_k) * stride_kg_dim,
+            raw_g,
+            mask=token_valid,
+        )
+        if token_offset == 0:
+            q0 = q
+            normalized_k0 = normalized_k
+            normalized_k_q0 = normalized_k_q
+            decay0 = tl.exp(gate)
+            beta0 = tl.sigmoid(raw_beta)
+        elif token_offset == 1:
+            q1 = q
+            normalized_k1 = normalized_k
+            normalized_k_q1 = normalized_k_q
+            decay1 = tl.exp(gate)
+            beta1 = tl.sigmoid(raw_beta)
+        elif token_offset == 2:
+            q2 = q
+            normalized_k2 = normalized_k
+            normalized_k_q2 = normalized_k_q
+            decay2 = tl.exp(gate)
+            beta2 = tl.sigmoid(raw_beta)
+        elif token_offset == 3:
+            q3 = q
+            normalized_k3 = normalized_k
+            normalized_k_q3 = normalized_k_q
+            decay3 = tl.exp(gate)
+            beta3 = tl.sigmoid(raw_beta)
+        elif token_offset == 4:
+            q4 = q
+            normalized_k4 = normalized_k
+            normalized_k_q4 = normalized_k_q
+            decay4 = tl.exp(gate)
+            beta4 = tl.sigmoid(raw_beta)
+        elif token_offset == 5:
+            q5 = q
+            normalized_k5 = normalized_k
+            normalized_k_q5 = normalized_k_q
+            decay5 = tl.exp(gate)
+            beta5 = tl.sigmoid(raw_beta)
+        elif token_offset == 6:
+            q6 = q
+            normalized_k6 = normalized_k
+            normalized_k_q6 = normalized_k_q
+            decay6 = tl.exp(gate)
+            beta6 = tl.sigmoid(raw_beta)
+        else:
+            q7 = q
+            normalized_k7 = normalized_k
+            normalized_k_q7 = normalized_k_q
+            decay7 = tl.exp(gate)
+            beta7 = tl.sigmoid(raw_beta)
+
+    for pid_v in tl.static_range(V // BV):
+        current_offs_v = pid_v * BV + offs_v
+        state = tl.load(
+            state_ptr
+            + state_idx * stride_state_block
+            + pid_h * stride_state_head
+            + current_offs_v[:, None] * stride_state_v
+            + offs_k[None, :] * stride_state_k
+        ).to(tl.float32)
+        for token_offset in tl.static_range(SPEC_QUERY_LEN):
+            if token_offset < query_len:
+                token = bos + token_offset
+                v = tl.load(
+                    v_ptr
+                    + token * stride_v_token
+                    + pid_h * V
+                    + current_offs_v
+                ).to(tl.float32)
+                if token_offset == 0:
+                    q = q0
+                    normalized_k = normalized_k0
+                    normalized_k_q = normalized_k_q0
+                    decay = decay0
+                    beta = beta0
+                elif token_offset == 1:
+                    q = q1
+                    normalized_k = normalized_k1
+                    normalized_k_q = normalized_k_q1
+                    decay = decay1
+                    beta = beta1
+                elif token_offset == 2:
+                    q = q2
+                    normalized_k = normalized_k2
+                    normalized_k_q = normalized_k_q2
+                    decay = decay2
+                    beta = beta2
+                elif token_offset == 3:
+                    q = q3
+                    normalized_k = normalized_k3
+                    normalized_k_q = normalized_k_q3
+                    decay = decay3
+                    beta = beta3
+                elif token_offset == 4:
+                    q = q4
+                    normalized_k = normalized_k4
+                    normalized_k_q = normalized_k_q4
+                    decay = decay4
+                    beta = beta4
+                elif token_offset == 5:
+                    q = q5
+                    normalized_k = normalized_k5
+                    normalized_k_q = normalized_k_q5
+                    decay = decay5
+                    beta = beta5
+                elif token_offset == 6:
+                    q = q6
+                    normalized_k = normalized_k6
+                    normalized_k_q = normalized_k_q6
+                    decay = decay6
+                    beta = beta6
+                else:
+                    q = q7
+                    normalized_k = normalized_k7
+                    normalized_k_q = normalized_k_q7
+                    decay = decay7
+                    beta = beta7
+                state, correction, state_q = _kda_prepared_step(
+                    state, normalized_k, q, v, decay, beta
+                )
+                out = state_q + correction * normalized_k_q
+                tl.store(
+                    out_ptr + token * stride_out_token + pid_h * V + current_offs_v,
+                    out,
+                )
+                tl.store(
+                    correction_cache_ptr
+                    + pid_b * stride_correction_row
+                    + pid_h * stride_correction_head
+                    + token_offset * stride_correction_pos
+                    + current_offs_v * stride_correction_dim,
+                    correction,
+                )
+
+
+
+@triton.jit
 def _ascend_kda_recoverssm_verify_tile_kernel(
     q_ptr,
     k_ptr,
@@ -113,7 +374,7 @@ def _ascend_kda_recoverssm_verify_tile_kernel(
     stride_state_indices,
     work_id,
     NUM_HEADS: tl.constexpr,
-    CONTIGUOUS_WORK: tl.constexpr,
+    PAIR_V_TILES: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BK: tl.constexpr,
@@ -136,10 +397,10 @@ def _ascend_kda_recoverssm_verify_tile_kernel(
 
     offs_k = tl.arange(0, BK)
     offs_v = pid_v * BV + tl.arange(0, BV)
-    if SPEC_QUERY_LEN >= 4 and K == BK and V % BV == 0:
-        mask_k = True
-        mask_v = True
-        mask_state = True
+    if K == BK and V % BV == 0 and (SPEC_QUERY_LEN != 2 or PAIR_V_TILES):
+        mask_k = None
+        mask_v = None
+        mask_state = None
     else:
         mask_k = offs_k < K
         mask_v = offs_v < V
@@ -151,7 +412,7 @@ def _ascend_kda_recoverssm_verify_tile_kernel(
             tl.store(
                 out_ptr + (bos + token_offset) * stride_out_token + pid_h * V + offs_v,
                 tl.zeros([BV], dtype=tl.float32),
-                mask=token_valid & mask_v,
+                mask=token_valid if mask_v is None else token_valid & mask_v,
             )
         query_len = tl.zeros((), dtype=tl.int64)
 
@@ -163,11 +424,17 @@ def _ascend_kda_recoverssm_verify_tile_kernel(
         + offs_v[:, None] * stride_state_v
         + offs_k[None, :] * stride_state_k
     )
-    state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
+    state = tl.load(
+        state_ptrs,
+        mask=mask_state,
+        other=0.0 if mask_state is not None else None,
+    ).to(tl.float32)
     A = tl.exp(tl.load(A_log_ptr + pid_h).to(tl.float32))
-    if SPEC_QUERY_LEN == 8 or CONTIGUOUS_WORK:
+    if SPEC_QUERY_LEN == 8 or PAIR_V_TILES:
         dt_bias = tl.load(
-            dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0
+            dt_bias_ptr + pid_h * K + offs_k,
+            mask=mask_k,
+            other=0.0 if mask_k is not None else None,
         ).to(tl.float32)
 
     for token_offset in tl.static_range(SPEC_QUERY_LEN):
@@ -176,33 +443,33 @@ def _ascend_kda_recoverssm_verify_tile_kernel(
             q = tl.load(
                 q_ptr + token * stride_q_token + pid_h * K + offs_k,
                 mask=mask_k,
-                other=0.0,
+                other=0.0 if mask_k is not None else None,
             ).to(tl.float32)
             k = tl.load(
                 k_ptr + token * stride_k_token + pid_h * K + offs_k,
                 mask=mask_k,
-                other=0.0,
+                other=0.0 if mask_k is not None else None,
             ).to(tl.float32)
             v = tl.load(
                 v_ptr + token * stride_v_token + pid_h * V + offs_v,
                 mask=mask_v,
-                other=0.0,
+                other=0.0 if mask_v is not None else None,
             ).to(tl.float32)
             raw_g = tl.load(
                 raw_g_ptr + token * stride_g_token + pid_h * K + offs_k,
                 mask=mask_k,
-                other=0.0,
+                other=0.0 if mask_k is not None else None,
             ).to(tl.float32)
             raw_beta = tl.load(
                 raw_beta_ptr + token * stride_beta_token + pid_h,
-                mask=True,
-                other=0.0,
             ).to(tl.float32)
 
             q *= tl.rsqrt(tl.sum(q * q) + 1e-6) * (K**-0.5)
-            if SPEC_QUERY_LEN != 8 and not CONTIGUOUS_WORK:
+            if SPEC_QUERY_LEN != 8 and not PAIR_V_TILES:
                 dt_bias = tl.load(
-                    dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0
+                    dt_bias_ptr + pid_h * K + offs_k,
+            mask=mask_k,
+            other=0.0 if mask_k is not None else None,
                 ).to(tl.float32)
             updated_state, correction = _kda_recurrent_step(
                 state,
@@ -299,7 +566,7 @@ def _ascend_kda_recoverssm_verify_kernel(
     BATCH: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     NUM_VECTOR_CORES: tl.constexpr,
-    CONTIGUOUS_WORK: tl.constexpr,
+    PAIR_V_TILES: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BK: tl.constexpr,
@@ -310,8 +577,10 @@ def _ascend_kda_recoverssm_verify_kernel(
 ):
     pid = tl.program_id(0)
     value_tiles = tl.cdiv(V, BV)
-    total_work = BATCH * NUM_HEADS * value_tiles
-    if CONTIGUOUS_WORK:
+    total_work = (
+        BATCH * NUM_HEADS if PAIR_V_TILES else BATCH * NUM_HEADS * value_tiles
+    )
+    if PAIR_V_TILES:
         num_programs = min(NUM_VECTOR_CORES, total_work)
         work_per_core = tl.cdiv(total_work, num_programs)
         first_work = pid * work_per_core
@@ -321,54 +590,100 @@ def _ascend_kda_recoverssm_verify_kernel(
         first_work = pid
         last_work = total_work
         step = tl.num_programs(0)
-    for work_id in range(first_work, last_work, step):
-        _ascend_kda_recoverssm_verify_tile_kernel(
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            raw_g_ptr,
-            raw_beta_ptr,
-            A_log_ptr,
-            dt_bias_ptr,
-            state_ptr,
-            correction_cache_ptr,
-            kg_cache_ptr,
-            out_ptr,
-            query_start_loc_ptr,
-            state_indices_ptr,
-            lower_bound,
-            null_block_id,
-            stride_q_token,
-            stride_k_token,
-            stride_v_token,
-            stride_g_token,
-            stride_beta_token,
-            stride_state_block,
-            stride_state_head,
-            stride_state_v,
-            stride_state_k,
-            stride_correction_row,
-            stride_correction_head,
-            stride_correction_pos,
-            stride_correction_dim,
-            stride_kg_row,
-            stride_kg_head,
-            stride_kg_pos,
-            stride_kg_dim,
-            stride_out_token,
-            stride_query_start_loc,
-            stride_state_indices,
-            work_id,
-            NUM_HEADS,
-            CONTIGUOUS_WORK,
-            K,
-            V,
-            BK,
-            BV,
-            SPEC_QUERY_LEN,
-            USE_LOWER_BOUND,
-            WORKLOAD_BUCKET,
-        )
+    for work_id in tl.parallel(first_work, last_work, step, bind_sub_block=True):
+        if PAIR_V_TILES:
+            _ascend_kda_recoverssm_verify_pair_kernel(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                raw_g_ptr,
+                raw_beta_ptr,
+                A_log_ptr,
+                dt_bias_ptr,
+                state_ptr,
+                correction_cache_ptr,
+                kg_cache_ptr,
+                out_ptr,
+                query_start_loc_ptr,
+                state_indices_ptr,
+                lower_bound,
+                null_block_id,
+                stride_q_token,
+                stride_k_token,
+                stride_v_token,
+                stride_g_token,
+                stride_beta_token,
+                stride_state_block,
+                stride_state_head,
+                stride_state_v,
+                stride_state_k,
+                stride_correction_row,
+                stride_correction_head,
+                stride_correction_pos,
+                stride_correction_dim,
+                stride_kg_row,
+                stride_kg_head,
+                stride_kg_pos,
+                stride_kg_dim,
+                stride_out_token,
+                stride_query_start_loc,
+                stride_state_indices,
+                work_id,
+                NUM_HEADS,
+                K,
+                V,
+                BV,
+                SPEC_QUERY_LEN,
+                USE_LOWER_BOUND,
+            )
+        else:
+            _ascend_kda_recoverssm_verify_tile_kernel(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                raw_g_ptr,
+                raw_beta_ptr,
+                A_log_ptr,
+                dt_bias_ptr,
+                state_ptr,
+                correction_cache_ptr,
+                kg_cache_ptr,
+                out_ptr,
+                query_start_loc_ptr,
+                state_indices_ptr,
+                lower_bound,
+                null_block_id,
+                stride_q_token,
+                stride_k_token,
+                stride_v_token,
+                stride_g_token,
+                stride_beta_token,
+                stride_state_block,
+                stride_state_head,
+                stride_state_v,
+                stride_state_k,
+                stride_correction_row,
+                stride_correction_head,
+                stride_correction_pos,
+                stride_correction_dim,
+                stride_kg_row,
+                stride_kg_head,
+                stride_kg_pos,
+                stride_kg_dim,
+                stride_out_token,
+                stride_query_start_loc,
+                stride_state_indices,
+                work_id,
+                NUM_HEADS,
+                PAIR_V_TILES,
+                K,
+                V,
+                BK,
+                BV,
+                SPEC_QUERY_LEN,
+                USE_LOWER_BOUND,
+                WORKLOAD_BUCKET,
+            )
 
 
 def kda_recoverssm_verify(
@@ -480,10 +795,13 @@ def kda_recoverssm_verify(
         query_start_loc.stride(0),
         state_indices.stride(0),
     )
+    pair_v_tiles = spec_query_len in (2, 4, 8) and key_dim == 128 and value_dim == 128
     grid = lambda meta: (  # noqa: E731
         min(
             _vector_core_count(device),
-            batch * num_heads * triton.cdiv(value_dim, meta["BV"]),
+            batch
+            * num_heads
+            * (1 if pair_v_tiles else triton.cdiv(value_dim, meta["BV"])),
         ),
     )
     _ascend_kda_recoverssm_verify_kernel[grid](
@@ -506,7 +824,7 @@ def kda_recoverssm_verify(
         BATCH=batch,
         NUM_HEADS=num_heads,
         NUM_VECTOR_CORES=_vector_core_count(device),
-        CONTIGUOUS_WORK=spec_query_len == 2 and workload_bucket == 512,
+        PAIR_V_TILES=pair_v_tiles,
         K=key_dim,
         V=value_dim,
         BK=block_k,

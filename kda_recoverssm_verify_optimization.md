@@ -380,3 +380,181 @@ PYTHONPATH=src python -m pytest -q -s benchmark/test_kda_recoverssm_verify.py \
 生产路径 `no_torch_fallback` 检查为 0 violations，`py_compile` 和 `git diff --check` 通过。功能覆盖 BF16/FP16 activation、FP32/BF16 state、Q2/Q4/Q8、ragged、NULL checkpoint、预分配 `out` 和接口异常路径；性能表只覆盖 Ascend910B4-1 的 BF16 生产形状，未验证 A5。
 
 当前 kernel 仍以 FP32 逐元素运算、归一化、指数/sigmoid 和矩阵-向量归约为主，编译模式为 `mix_mode='aiv'`。虽然已确认存在 20 个 Cube 核，但简单改成 20 个 program 或一次 `tl.dot` 并不能有效利用它们；后续若继续优化，需要单独设计适合 GEMM 的数据布局，不能与 persistent 修复混为一轮。Q2/B32 的剩余约 4% 差距可从尾波负载均衡和 host/设备调度进一步分析，但不建议重新启用全局宏。
+
+
+## 10. Ascend Skills、满 tile 去 mask 与 `tl.parallel`（2026-11-26）
+
+### 10.1 可复用的优化方法
+
+参考 Ascend `agent-skills` 中的 `triton-operator-performance-optim`、`vector-triton-ascend-ops-optimizer` 和 `triton-operator-performance-eval`。第 9 节的 persistent Vector、核内多 tile、连续工作区间、编译期常量和 profiler 驱动与这些技能的建议一致。本次进一步落实：
+
+- 目标 Q2 小桶及全部 Q4/Q8 在满 tile 时使用 `mask=None`，并删除对应的 `tl.load(other=...)`，减少谓词和标量操作。
+- 其他 Q2 继续使用 masked path，避免大 batch 回退；`head_dim=96` 等非规则输入仍走 masked fallback。
+- persistent 工作循环由 `range` 改为 `tl.parallel(..., bind_sub_block=True)`，保持 `mix_mode='aiv'`，不引入 Cube 调度或同步成本。
+
+`lb_none_small` 的 masked fallback 反证测试 6 项通过，完整功能回归 92 项通过，仓库 benchmark 通过。
+
+### 10.2 dot 与 Cube-Vector 同步评估
+
+KDA 的 `state @ k` 和 `state @ q` 都是 `[BV, K] × [K]` 矩阵-向量归约。为进入 Cube/混合路径，实验将向量广播为 `[K, 16]` 后调用 `tl.dot`，再用第一列作为结果。单项探针中，普通 `tl.sum` 为 2.813 µs、`mix_mode='aiv'`，16 列 dot 为 3.974 µs、`mix_mode='mix'`。虽然确认能进入混合路径，但增加了冗余计算和同步成本。
+
+完整替换 correction 和 output 的两处归约后，Q2/B32 为 1075.448 µs、B128 为 4210.658 µs，相比当前约 95/347 µs 慢约 11 倍，已回退。Cube-Vector 同步依赖有效的混合计算路径，因此不再叠加。对角线 Grid 面向可复用的 M×N 矩阵块；本算子的 checkpoint state 基本不复用，当前连续 V tile 更利于 q/k/dt_bias 的局部性，不适用该调度。
+
+### 10.3 最新生产 Shape 性能
+
+下表为“分桶去 mask + `tl.parallel`”的最终实测，替代第 9.5 节作为当前结果。所有形状均快于旧宏路径；Q2/B32 的 `vs Base` 为 0.753，旧宏路径为 0.741。
+
+| Case | 当前 Gems (ms) | Gems SpeedUp | vs Base | 旧宏 Gems (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| k3_tp8_mtp1_bs32 | 0.095124 | 10.008 | 0.753 | 0.096693 |
+| k3_tp8_mtp1_bs128 | 0.347147 | 41.386 | 0.539 | 0.353485 |
+| k3_tp8_mtp1_bs256 | 0.696114 | 82.285 | 0.464 | 0.704790 |
+| k3_tp8_spec3_bs32 | 0.180519 | 9.963 | 0.631 | 0.193517 |
+| k3_tp8_spec3_bs128 | 0.678127 | 40.381 | 0.526 | 0.696283 |
+| k3_tp8_win8_bs32 | 0.351779 | 9.929 | 8.732 | 0.372113 |
+| k3_tp4_mtp1_bs64 | 0.346005 | 41.457 | 0.545 | 0.354147 |
+| k3_tp2_mtp1_bs64 | 0.697741 | 81.989 | 0.467 | 0.704675 |
+| k3_tp1_mtp1_bs8 | 0.177955 | 20.499 | 0.674 | 0.181677 |
+| k3_tp1_spec3_bs16 | 0.679359 | 40.265 | 0.525 | 0.697657 |
+
+`tl.parallel` 相对仅去 mask 的版本属于小幅改进而非数量级变化，主要价值仍来自 persistent Vector、分桶调度和去 mask。后续试验重点是外层 work-item 的 Double Buffer、尾波负载均衡，以及不依赖 padded dot 的 UB/访存优化。
+
+
+## 11. 后续优化试验：Double Buffer、尾波均分和块对角 GEMM（2026-11-26）
+
+### 11.1 外层 Double Buffer
+
+对 q/k/v/raw_g 的 token 内加载分别尝试 `tl.multibuffer(tensor, 2)` 和 `tl.compile_hint(tensor, "multi_buffer", 2)`。当前 Triton 的 `tl.multibuffer` 是原地 hint、返回 `None`，不能按部分文档示例重新赋值。修正调用形式后，两种写法均在 CANN 9.2.1 的 BiShengIR 阶段产生 `attempting to parse a byte at the end of the bytecode`，属于编译器兼容问题，而非可接受的性能取舍。该路线已回退，未进入生产代码。
+
+### 11.2 商余均分尾波实验
+
+目标 Q2/B32 在 BV64 下共有 768 个 tile。原连续分配为 `ceil(768 / 40) = 20`：program 0–37 各 20 个，38 号 8 个，39 号 0 个。实验改为商余均分：前 8 个 program 各 20 个，其余 32 个各 19 个。
+
+| 分配方式 | Q2/B32 latency |
+| --- | ---: |
+| 原 `ceil` 连续分配 | 95.124 µs |
+| 商余均分 | 95.335 µs |
+
+差异约 0.2%，没有稳定收益。两种方案的最长工作量均为 20 tile，均分只能减少空核，不能降低关键路径，因此恢复原实现，不增加额外分配复杂度。
+
+### 11.3 真正的多头块对角 GEMM
+
+为区分 padded dot 与真实矩阵化，另构造 `BH=16, BV=8, K=128` 的块对角 K 矩阵，使 `state @ K` 成为合法 GEMM。该实现会计算并丢弃大量跨 head 项，同时增加输出矩阵和 UB 开销。
+
+| 实现 | Latency | mix_mode |
+| --- | ---: | --- |
+| 分 head 的 `tl.sum` | 1.919 µs | aiv |
+| 块对角 `tl.dot` | 3.397 µs | mix |
+
+真实 GEMM 仍慢约 1.77 倍。与第 10.2 节完整 padded dot 的约 11 倍回退相互印证：当前矩阵-向量及 recurrent 结构不适合为了 Cube 利用率引入额外列或跨 head 计算。后续如重新评估 Cube，需要先出现不增加冗余工作的矩阵化算法，而不是继续调整 dot 形状。
+
+本轮保留第 10 节的“分桶去 mask + `tl.parallel`”实现。Double Buffer、尾波均分和块对角 GEMM 均未保留；最终功能测试仍为 92 passed，仓库 benchmark 为 1 passed。
+
+
+## 12. TLE 文档导向实验：循环展开与 DSA activation copy（2026-11-26）
+
+编译器源码已切换到 `FlagTree` 的 `0.7.2a1+ascend3.5` tag（`72f00659f`），并遍历 `documents/tle` 全部 27 份文档。基于文档建议，对 persistent 外层循环展开和 DSA buffer 搬运进行了验证。
+
+### 12.1 `loop_unroll_factor` 不适用于当前 kernel
+
+`tle.dsa.parallel` 文档允许通过 `loop_unroll_factor` 展开无依赖循环。当前外层 work-item 在语义上独立，但设置 `loop_unroll_factor=2` 后，Q2/B32 出现 5481/98304 个错误元素，说明当前编译器不能正确处理本 kernel 的展开路径。该改动立即回退，未继续测试 factor=4，也未进入性能比较。
+
+### 12.2 DSA activation copy 可行但无直接收益
+
+使用 `tle.dsa.alloc(..., mem_addr_space=tle.dsa.ascend.UB)`、`with tle.dsa.hint(inter_no_alias=True): tle.dsa.copy(...)` 和 `tle.dsa.to_tensor` 替换 q/k/v/raw_g 的普通 `tl.load`，输出与 native 一致，说明文档中的 DSA buffer 路径可用于本 kernel。
+
+| 实现 | B32 | B128 |
+| --- | ---: | ---: |
+| 当前最优实现 | 95.124 µs | 347.147 µs |
+| 仅 q 改为 DSA copy | 95.372 µs | — |
+| q/k/v/raw_g 全部改为 DSA copy | 95.471 µs | 348.038 µs |
+
+差异均小于约 0.4%，没有直接性能收益。DSA buffer 可作为后续手工双缓冲的备选实现，但当前证据不足以支持引入双 buffer、额外 token 形状管理和 ragged 边界处理。正式实现仍保留第 10 节的“分桶去 mask + `tl.parallel`”。
+
+`sub_vec_id` 只允许 AIC/AIV 混合模式，当前 KDA 为 `mix_mode='aiv'`，不能使用；`disable_bubble_up` 需要先确认 MLIR 中存在重复上浮，当前没有 extract_slice 路径；CV 同步和 `tle.pipe` 仍要求有效 GEMM，因此均不采用。
+
+
+## 13. Q2/B32 标量、双 V tile 与归约实验（2026-11-27）
+
+### 13.1 独立单变量实验
+
+以第 12 节代码为基线，使用相同 BF16 + FP32 state、仓库 `do_bench_npu` 口径复测 Q2/TP8/B32。本轮基线为 95.268 µs，与第 12 节的 95.124 µs 属于正常的跨进程小幅波动。
+
+| 实验 | Latency | 结论 |
+| --- | ---: | --- |
+| 当前基线 | 95.268 µs | 对照 |
+| 标准连续布局使用编译期常量 stride | 98.850 µs | 回退，慢约 3.8% |
+| 热路径 int32 索引 | 95.721 µs | 无稳定收益，回退 |
+| Q2 完全移除 token guard | 99.360 µs | 回退；实验路径也不支持 ragged/NULL |
+| q/k 使用 `tl.join` 合并平方和归约 | 编译失败 | UB 需求 8,750,080 bits，超过 1,572,864 bits |
+
+TTIR 确认原热点循环存在运行时 stride 乘法、int64 扩展及 work-item 除法/取余，但减少这些标量操作并不必然改善最终调度。常量 stride、int32 和去 guard 均未保留。
+
+### 13.2 双 V tile 复用公共向量
+
+目标形状原来将每个 `(request, head)` 分成两个 BV64 work item，重复加载 q/k/raw_g 并计算归一化和 gate。专用 Q2 路径改为一个 work item 处理一个 `(request, head)`，总工作量由 768 降为 384：先预处理两个 token 的 q、normalized k、decay 和 beta，再顺序处理两个 V tile。任意时刻只保留一份 FP32 state tile，避免 BV128 的 UB 溢出。
+
+输出使用代数等价形式：
+
+```text
+out = decayed_state · q + correction * (normalized_k · q)
+```
+
+该形式在 state 更新前完成 `decayed_state · q`，不再对更新后的完整 state 做一次矩阵-向量归约，但增加一个 K 维 `normalized_k · q` 归约。实测编译器调度有所改善；由于浮点归约顺序改变，仍必须通过 native 和 FP64 oracle 验证。
+
+| 实现 | Latency | 相对本轮基线 |
+| --- | ---: | ---: |
+| 双 V 公共向量复用 | 84.704 µs | -11.1% |
+| 双 V + 代数输出，无预处理 mask 的实验上限 | 83.760 µs | -12.1% |
+| 双 V + 代数输出，安全预处理 mask | 86.999 µs | -8.7% |
+
+正式路径保留安全 mask，避免 ragged 尾部和 NULL 请求在预处理阶段越界读取。专用路径仅用于 `Q2 + WORKLOAD_BUCKET=512 + K=V=128`，其他形状继续使用原 persistent tile 路径。
+
+### 13.3 下一 V tile 的 DSA state 预取
+
+在双 V + 代数输出的无 mask 实验版本上，于 V0 计算前通过 `tle.dsa.copy` 将 V1 state 复制到 UB，再在 V1 阶段使用 `tle.dsa.to_tensor`。延迟由 83.760 µs 回退到 92.407 µs，慢约 10.3%。当前编译器没有从这次显式预取获得有效重叠，额外 UB 和搬运管理反而增加开销，因此不保留。
+
+### 13.4 正确性与边界验证
+
+最终安全版本通过全部 92 项功能测试。另构造 42 requests、12 heads、Q2 的同分桶用例，混合 1/2-token 请求并包含 3 个 NULL checkpoint；输出、correction、key_gate 和 checkpoint 只读语义均与 native 一致。该补充用例覆盖了原测试集未触发的“专用分桶 + ragged + NULL”组合。生产路径 `no_torch_fallback` 检查为 0 violations。
+
+仓库标准 benchmark 中，Q2/TP8/B32 的 native 为 0.951897 ms，Gems 为 0.086686 ms，SpeedUp 为 10.981，vs Base 由第 10 节的 0.753 提升到 0.827。其余 9 个生产 shape 继续走原路径，Gems 延迟为 0.178005–0.697230 ms，均成功通过精度和性能测试，未出现实质回退。
+
+
+## 14. 双 V 公共预处理推广到全部生产 Shape（2026-11-27）
+
+第 13 节只启用了 Q2 的 512 小桶。本轮将实现推广到全部 `Q2/Q4/Q8 + K=V=128` 生产形状，并进一步把 key_gate 写入和 `normalized_k · q` 移到公共预处理阶段。每个 `(request, head, token)` 的 q/k 归一化、gate、beta、key_gate 和 `normalized_k · q` 只计算一次，两个 V tile 共用结果；state 仍按 BV64 顺序处理。
+
+下表“原通用路径”使用第 13 节基线或上一轮标准 benchmark，“全 Shape 双 V”使用本轮相同的仓库 `do_bench_npu` 口径。B32 相对第 13 节已优化版本只有约 0.5% 的额外变化，相对最初通用路径则下降约 9.5%。
+
+| Case | 原通用路径 | 全 Shape 双 V | 延迟下降 |
+| --- | ---: | ---: | ---: |
+| k3_tp8_mtp1_bs32 | 95.268 µs | 86.252 µs | 9.5% |
+| k3_tp8_mtp1_bs128 | 347.279 µs | 321.754 µs | 7.3% |
+| k3_tp8_mtp1_bs256 | 696.721 µs | 647.153 µs | 7.1% |
+| k3_tp8_spec3_bs32 | 181.041 µs | 164.555 µs | 9.1% |
+| k3_tp8_spec3_bs128 | 679.821 µs | 627.783 µs | 7.7% |
+| k3_tp8_win8_bs32 | 353.167 µs | 334.349 µs | 5.3% |
+| k3_tp4_mtp1_bs64 | 345.308 µs | 320.669 µs | 7.1% |
+| k3_tp2_mtp1_bs64 | 697.230 µs | 648.171 µs | 7.0% |
+| k3_tp1_mtp1_bs8 | 178.005 µs | 164.683 µs | 7.5% |
+| k3_tp1_spec3_bs16 | 678.345 µs | 627.920 µs | 7.4% |
+
+十个生产形状均有收益，因此最终不再按 workload 小桶限制双 V 路径；`Q2/Q4/Q8 + K=V=128` 全部启用，其他维度继续使用通用 persistent tile 实现。Q4/Q8 使用静态展开保存各 token 的公共向量，没有引入动态张量索引或额外 GM workspace。
+
+全 Shape 版本通过全部 92 项功能测试，覆盖 Q4 NULL、Q8 ragged、Q2 无 lower_bound、BF16/FP16 activation 和 FP32/BF16 state。生产路径 `no_torch_fallback` 检查保持 0 violations。
+
+最终仓库标准 benchmark 为 1 passed，十个形状均成功：
+
+| Case | Gems (ms) | SpeedUp | vs Base |
+| --- | ---: | ---: | ---: |
+| k3_tp8_mtp1_bs32 | 0.085927 | 11.071 | 0.834 |
+| k3_tp8_mtp1_bs128 | 0.319622 | 44.774 | 0.586 |
+| k3_tp8_mtp1_bs256 | 0.641818 | 89.296 | 0.503 |
+| k3_tp8_spec3_bs32 | 0.164113 | 10.962 | 0.694 |
+| k3_tp8_spec3_bs128 | 0.628163 | 43.564 | 0.568 |
+| k3_tp8_win8_bs32 | 0.328907 | 10.620 | 9.340 |
+| k3_tp4_mtp1_bs64 | 0.319557 | 44.760 | 0.590 |
+| k3_tp2_mtp1_bs64 | 0.641007 | 89.238 | 0.508 |
+| k3_tp1_mtp1_bs8 | 0.164569 | 22.173 | 0.729 |
+| k3_tp1_spec3_bs16 | 0.628691 | 43.515 | 0.568 |

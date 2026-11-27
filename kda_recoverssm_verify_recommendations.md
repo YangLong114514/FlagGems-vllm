@@ -2,7 +2,7 @@
 
 原始评估基于 `feat/kda-recoverssm-verify` 的 `d934b34`，建议文档首次提交于 `61f3200`。在当前分支的 rebase 历史中，两者分别对应 `f595715` 和 `6fd993a`。原评估引用 NVIDIA H800 相对 vLLM 0.34.0 Triton 实现的测量，输入为 BF16 activation、FP32 checkpoint，生产形状均为 `K=V=128`。Q2、Q4、Q8 分别表示每个请求最多验证 2、4、8 个 token。Ascend 独立后端及 persistent Vector 优化记录见[优化记录第 9 节](kda_recoverssm_verify_optimization.md#9-ascend-独立后端与-persistent-vector-优化2026-11-26)。[原始评估依据](https://github.com/YangLong114514/FlagGems-vllm/blob/d934b3461dbf76f00027e20ffaaf18e1cdd15695/kda_recoverssm_verify_optimization.md)
 
-## 建议落实情况（截至昇腾分支 `f188929`）
+## 建议落实情况（截至当前 Ascend 优化）
 
 | 工作项 | 后续结果 |
 | --- | --- |
@@ -10,8 +10,12 @@
 | 检查 Graph 配置与窗口内核 | 已加入 `batch × heads` 的 workload 分桶。Q2/Q4 全局外提 `dt_bias` 及 Q4/Q8 满窗特化均做过实验；交付代码保留 Q8 外提。各轮配置和回退依据见优化记录第 2、5、6 节。 |
 | 后续新增的厂商基线 | 精度和同机性能已按安装版 native 的签名适配两种缓存布局。H800 已采集 26 条基线，Ascend910B4-1 已完成 10 个 BF16 生产形状的同机比较和跨芯片折算。PPU 真机冷启动仍待确认。 |
 | Ascend 独立后端与 persistent Vector | 新增独立后端，显式关闭 auto-blockify，并按 40 个 Vector 核实现 program 内多 tile 循环。Q2/B32 使用连续工作区间、固定 BV64 和分桶 `dt_bias` 外提，延迟由首版 132.572 µs 降至 100.656 µs；完整 92 项功能测试及仓库 benchmark 通过。详见优化记录第 9 节。 |
+| 满 tile 去 mask 与 `tl.parallel` | Q2 小桶和 Q4/Q8 满 tile 使用 `mask=None`，其他 Q2 保留 masked path；工作循环改用 `tl.parallel(bind_sub_block=True)`。当前 Q2/B32 为 95.124 µs、vs Base 为 0.753，全部生产形状快于旧宏路径。16 列 padded dot 慢约 11 倍，已回退；Cube-Vector 同步和对角线 Grid 不适用。详见优化记录第 10 节。 |
+| Double Buffer、尾波均分与块对角 GEMM | 两种 Double Buffer 写法均触发当前编译器 bytecode 错误；商余均分没有稳定收益，最长工作量不变；真实块对角 GEMM 仍慢约 1.77 倍，均不保留。详见优化记录第 11 节。 |
+| TLE 循环展开与 DSA copy | `loop_unroll_factor=2` 会产生错误结果，已回退；q/k/v/raw_g 的 DSA copy 对拍正确但收益不足约 0.4%，暂不引入手工双缓冲。详见优化记录第 12 节。 |
+| 双 V tile 与归约 | 常量 stride、int32 索引、去 token guard 和合并 q/k 归约均无可用收益；下一 state 的 DSA 预取慢约 10.3%，未保留。双 V 公共预处理已推广到全部 Q2/Q4/Q8 生产形状，key_gate 和 `normalized_k·q` 也在两个 V tile 间复用，十个形状延迟下降约 5.3%–9.5%。详见优化记录第 13、14 节。 |
 
-跨平台版本对应、提交号、采集命令及验证范围见[优化记录第 8 节](kda_recoverssm_verify_optimization.md#8-多平台精度和性能基线2026-11-25)，Ascend 宏问题、persistent 设计、profiler 数据和最终性能见[优化记录第 9 节](kda_recoverssm_verify_optimization.md#9-ascend-独立后端与-persistent-vector-优化2026-11-26)。以下保留 `d934b34` 时的判断和实验设计，便于追溯每项建议的依据。
+跨平台版本对应、提交号、采集命令及验证范围见[优化记录第 8 节](kda_recoverssm_verify_optimization.md#8-多平台精度和性能基线2026-11-25)，Ascend 宏问题和 persistent 设计见[优化记录第 9 节](kda_recoverssm_verify_optimization.md#9-ascend-独立后端与-persistent-vector-优化2026-11-26)，去 mask、dot 评估及最新性能见[优化记录第 10 节](kda_recoverssm_verify_optimization.md#10-ascend-skills满-tile-去-mask-与-tlparallel2026-11-26)，Double Buffer、尾波均分和块对角 GEMM 试验见[优化记录第 11 节](kda_recoverssm_verify_optimization.md#11-后续优化试验double-buffer尾波均分和块对角-gemm2026-11-26)，TLE 循环展开与 DSA copy 试验见[优化记录第 12 节](kda_recoverssm_verify_optimization.md#12-tle-文档导向实验循环展开与-dsa-activation-copy2026-11-26)，双 V tile 和归约试验见[优化记录第 13 节](kda_recoverssm_verify_optimization.md#13-q2b32-标量双-v-tile-与归约实验2026-11-27)，全生产形状推广见[优化记录第 14 节](kda_recoverssm_verify_optimization.md#14-双-v-公共预处理推广到全部生产-shape2026-11-27)。以下保留 `d934b34` 时的判断和实验设计，便于追溯每项建议的依据。
 
 ## 原始评估的优先结论
 
